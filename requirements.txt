@@ -1,0 +1,4 @@
+# Die Node braucht nur requests zusaetzlich - und selbst das bringt ComfyUI schon mit.
+# torch, numpy, Pillow und av bewusst NICHT hier auflisten: der ComfyUI-Manager wuerde sie
+# sonst ggf. neu installieren und dabei die CUDA-Version von torch zerschiessen.
+requests>=2.28
