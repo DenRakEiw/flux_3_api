@@ -1,44 +1,32 @@
-"""ComfyUI nodes for the BFL Flux 3 API (flux-3-large / flux-3-distilled)."""
+"""ComfyUI node for the BFL Flux 3 Video API (POST /v1/flux-3-video).
+
+Single documented endpoint, four modes: t2v, i2v, v2v, draft_enhance.
+Spec: https://docs.bfl.ai/api-reference/utility/generate-a-video-with-flux-3
+"""
 
 import asyncio
 import io
 import logging
+from typing import Any
 
 import torch
 
 from .flux3_client import (
+    ASPECT_RATIOS,
     DEFAULT_TIMEOUT_MINUTES,
-    ENDPOINTS,
-    IMAGE_ASPECT_RATIOS,
-    IMAGE_SIZES,
-    MODELS,
-    PREVIEW_ASPECT_RATIOS,
-    PREVIEW_DURATIONS,
-    PREVIEW_FPS,
-    PREVIEW_LONG_DURATION_BLOCKED,
-    PREVIEW_MAX_REFERENCE_IMAGES,
-    PREVIEW_MAX_SEED,
-    PREVIEW_MAX_VIDEO_SECONDS,
-    PREVIEW_MIN_IMAGE_PX,
-    PREVIEW_MODE_TO_FIELD,
-    PREVIEW_RESOLUTIONS,
-    VIDEO_MODELS,
-    MODES_CONDITIONING_NOISE,
-    MODES_MANY_IMAGES,
-    MODES_ONE_IMAGE,
-    MODES_START_END,
-    MODES_VIDEO,
-    VIDEO_ASPECT_RATIOS,
-    VIDEO_DURATIONS,
+    DURATION_MAX,
+    DURATION_MIN,
+    DURATIONS,
+    MAX_KEYFRAMES,
+    RESOLUTIONS,
+    SAFETY_TOLERANCE_DEFAULT,
+    SAFETY_TOLERANCE_MAX,
+    SAFETY_TOLERANCE_MIN,
     VIDEO_MODES,
-    VIDEO_RESOLUTIONS,
     Flux3Client,
     batch_to_base64,
-    bytes_to_image_tensor,
     extract_url,
     format_metadata,
-    get_webhook_url,
-    post_discord_message,
     tensor_to_base64,
     video_to_base64,
 )
@@ -50,357 +38,155 @@ from comfy_api.input_impl import VideoFromFile
 CATEGORY = "Flux3 API"
 
 
-def _common_inputs() -> dict:
-    return {
-        "model": (MODELS, {"default": "flux-3-large",
-                           "tooltip": "large = volle Qualität, distilled = schnell"}),
-        "prompt": ("STRING", {"multiline": True, "default": ""}),
-        "negative_prompt": ("STRING", {"multiline": True, "default": ""}),
-        # Capped at 2^32-1, not 2^64-1: flux-3-preview-high rejects anything above that,
-        # and ComfyUI's "randomize" would otherwise produce a failing seed nearly every run.
-        # large/distilled accept any integer, so this range is safe for all endpoints.
-        "seed": ("INT", {"default": 0, "min": 0, "max": PREVIEW_MAX_SEED,
-                         "tooltip": "0 = zufällig (Feld wird nicht gesendet). Max 4294967295 — "
-                                    "flux-3-preview-high erlaubt nicht mehr."}),
-        "steps": ("INT", {"default": 0, "min": 0, "max": 50,
-                          "tooltip": "1-50. 0 = API-Default verwenden"}),
-        "guidance": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 100.0, "step": 0.1,
-                               "tooltip": "0 = API-Default verwenden"}),
-        "prompt_upsampling": ("BOOLEAN", {"default": False}),
-    }
-
-
-async def _notify_discord(webhook_override: str, task: dict) -> None:
-    """Post the bare task id to Discord; a bot-side script turns it into the video."""
-    webhook = get_webhook_url(webhook_override)
-    if not webhook:
-        return
-    task_id = task.get("id")
-    if task_id:
-        await asyncio.to_thread(post_discord_message, webhook, task_id)
-
-
-async def _run(client: Flux3Client, model: str, payload: dict,
+async def _run(client: Flux3Client, payload: dict,
                timeout_minutes: int = DEFAULT_TIMEOUT_MINUTES) -> tuple[dict, dict, bytes]:
     """Submit, poll and download without blocking the executor.
 
     Every step is either awaited or pushed onto a thread, so ComfyUI can run other
     Flux nodes in the same graph concurrently instead of one after another.
     """
-    task = await asyncio.to_thread(client.submit, model, payload)
+    task = await asyncio.to_thread(client.submit, payload)
     result = await client.poll_async(task, timeout=timeout_minutes * 60)
     data = await asyncio.to_thread(client.download, extract_url(result))
     return task, result, data
 
 
-def _build_preview_payload(mode: str, prompt: str, seed: int, aspect_ratio: str,
-                           duration: str, video_resolution: str, generate_audio: bool,
-                           grounding: bool, version: str, ignored: dict) -> dict:
-    """Payload for flux-3-preview-high (the documented early-access API).
-
-    There is no `mode` field here: whichever input field is filled decides the
-    behaviour. The mode widget picks that field, so the node's UI stays the same
-    across both endpoints. Constraints from the docs are enforced before sending.
-    """
-    if mode not in PREVIEW_MODE_TO_FIELD:
-        raise ValueError(
-            f"Flux3: flux-3-preview-high kennt den Modus '{mode}' nicht. "
-            f"Erlaubt: {', '.join(PREVIEW_MODE_TO_FIELD)}."
-        )
-
-    payload = {"prompt": prompt}
-
-    if aspect_ratio not in PREVIEW_ASPECT_RATIOS:
-        raise ValueError(
-            f"Flux3: flux-3-preview-high kennt das Seitenverhältnis '{aspect_ratio}' nicht. "
-            f"Erlaubt: {', '.join(PREVIEW_ASPECT_RATIOS)}."
-        )
-    payload["aspect_ratio"] = aspect_ratio
-
-    # "5s" -> 5; this endpoint wants ints and has no 2s option.
-    dur = duration.rstrip("s")
-    if dur not in PREVIEW_DURATIONS:
-        raise ValueError(
-            f"Flux3: flux-3-preview-high unterstützt die Länge '{duration}' nicht. "
-            f"Erlaubt: auto, 5s, 10s, 15s, 20s (kein 2s)."
-        )
-    payload["duration"] = dur if dur == "auto" else int(dur)
-
-    if video_resolution not in PREVIEW_RESOLUTIONS:
-        raise ValueError(
-            f"Flux3: flux-3-preview-high unterstützt die Auflösung '{video_resolution}' nicht. "
-            f"Erlaubt: {', '.join(PREVIEW_RESOLUTIONS)} (kein 192p/352p)."
-        )
-    payload["resolution"] = video_resolution   # note: not "video_resolution" here
-
-    # Documented constraint: 720p + edit_video/reference_video rejects 15/20s.
-    if (mode in PREVIEW_LONG_DURATION_BLOCKED and video_resolution == "720p"
-            and dur in ("15", "20")):
-        raise ValueError(
-            f"Flux3: '{mode}' erlaubt bei 720p keine {dur}s — nimm 5s/10s oder 480p."
-        )
-
-    if seed:
-        if seed > PREVIEW_MAX_SEED:
-            raise ValueError(
-                f"Flux3: flux-3-preview-high erlaubt seed nur bis {PREVIEW_MAX_SEED}, "
-                f"bekommen: {seed}."
-            )
-        payload["seed"] = int(seed)
-
-    if not generate_audio:
-        payload["generate_audio"] = False     # default is true
-    if not grounding:
-        payload["grounding"] = False          # default is true
-    if version.strip() and version.strip() != "latest":
-        payload["version"] = version.strip()
-
-    used = [k for k, v in ignored.items() if v]
-    if used:
-        log.warning("Flux3: flux-3-preview-high kennt diese Einstellungen nicht, sie werden "
-                    "ignoriert: %s", ", ".join(used))
-    return payload
-
-
-def _check_preview_images(images, field: str) -> None:
-    """Undocumented API rule: images must be at least 256x256, else a cryptic 422."""
-    h, w = int(images.shape[1]), int(images.shape[2])
-    if h < PREVIEW_MIN_IMAGE_PX or w < PREVIEW_MIN_IMAGE_PX:
-        raise ValueError(
-            f"Flux3: {field} braucht Bilder von mindestens "
-            f"{PREVIEW_MIN_IMAGE_PX}x{PREVIEW_MIN_IMAGE_PX} px — deins ist {w}x{h}."
-        )
-
-
-def _check_preview_video(video) -> None:
-    """Docs: video inputs must be mp4, <= 50 MB and <= 15 s. Catch it before the upload."""
+def _parse_keyframe_times(text: str) -> list[float]:
+    """'0, 4.5, 10' -> [0.0, 4.5, 10.0]. Accepts commas or semicolons."""
     try:
-        seconds = video.get_duration()
-    except Exception:      # pragma: no cover - exotic VIDEO impls
-        return
-    if seconds > PREVIEW_MAX_VIDEO_SECONDS + 0.5:
-        raise ValueError(
-            f"Flux3: flux-3-preview-high nimmt Videos bis "
-            f"{PREVIEW_MAX_VIDEO_SECONDS}s — dein Clip ist {seconds:.1f}s lang."
-        )
-
-
-def _preview_keyframes(mode: str, encoded: list[str], duration_value,
-                       keyframe_indices: str) -> list[dict]:
-    """Build the keyframes list: [{image_url, frame_index}, ...] (docs' field names)."""
-    if mode == "i2v":
-        if len(encoded) > 1:
-            log.warning("Flux3: i2v nutzt 1 Bild als Startframe — der Batch hat %d. "
-                        "Für mehrere Bilder: k2v (Storyboard) oder ir2v (Referenzen).",
-                        len(encoded))
-        return [{"image_url": encoded[0], "frame_index": 0}]
-
-    if mode == "ii2v":
-        # Docs: a two-image morph needs a whole-number duration, closing frame at duration*24.
-        if duration_value == "auto":
-            raise ValueError(
-                "Flux3: ii2v (Start→Endbild) braucht eine feste Länge — 'auto' geht nicht. "
-                "Stelle duration auf 5s/10s/15s/20s."
-            )
-        last = int(duration_value) * PREVIEW_FPS
-        return [{"image_url": encoded[0], "frame_index": 0},
-                {"image_url": encoded[1], "frame_index": last}]
-
-    # k2v: storyboard at explicit positions
-    try:
-        indices = [int(x) for x in keyframe_indices.replace(";", ",").split(",") if x.strip()]
+        return [float(x) for x in text.replace(";", ",").split(",") if x.strip()]
     except ValueError as exc:
         raise ValueError(
-            f"Flux3: keyframe_indices muss eine Liste ganzer Zahlen sein (z.B. '0, 24, 48'), "
-            f"bekommen: {keyframe_indices!r}"
+            f"Flux3: keyframe_times muss eine Liste von Sekunden sein (z.B. '0, 4.5, 10'), "
+            f"bekommen: {text!r}"
         ) from exc
-    if len(indices) != len(encoded):
+
+
+async def _build_keyframes(images: torch.Tensor | None, end_image: torch.Tensor | None,
+                           keyframe_times: str, duration_value: str) -> Any:
+    """Build the `keyframes` payload for i2v per the documented schema.
+
+    - 1 image, no times: opening frame           -> str
+    - 2 images (or images + end_image): start+end -> [str, str]
+    - 3+ images, no times: evenly spread          -> [str, ...]  (duration muss gesetzt sein)
+    - images + keyframe_times: storyboard         -> [[seconds, str], ...]
+    """
+    if images is None:
+        raise ValueError("Flux3: i2v braucht einen images-Input.")
+
+    # images + end_image ist die bequeme Art, Start+Ende zu stecken.
+    if end_image is not None:
+        imgs = torch.cat([images[:1], end_image[:1]])
+    else:
+        imgs = images
+
+    n = len(imgs)
+    if n < 1:
+        raise ValueError("Flux3: i2v braucht mindestens ein Bild am images-Input.")
+    if n > MAX_KEYFRAMES:
         raise ValueError(
-            f"Flux3: k2v braucht genau so viele keyframe_indices wie Bilder — "
-            f"{len(encoded)} Bild(er), aber {len(indices)} Index/Indizes."
+            f"Flux3: i2v nimmt höchstens {MAX_KEYFRAMES} Keyframes, der Batch hat {n}."
         )
-    if len(set(indices)) != len(indices):
-        raise ValueError(f"Flux3: keyframe_indices müssen eindeutig sein, bekommen: {indices}")
-    if duration_value != "auto":
-        limit = int(duration_value) * PREVIEW_FPS
-        too_big = [i for i in indices if i > limit]
-        if too_big:
+
+    times_text = keyframe_times.strip()
+    if times_text:
+        times = _parse_keyframe_times(times_text)
+        if len(times) != n:
             raise ValueError(
-                f"Flux3: keyframe_indices dürfen höchstens duration×{PREVIEW_FPS} = {limit} "
-                f"sein (bei {duration_value}s), zu groß: {too_big}"
+                f"Flux3: keyframe_times braucht genauso viele Werte wie Bilder — "
+                f"{n} Bild(er), aber {len(times)} Zeit(en)."
             )
-    return [{"image_url": img, "frame_index": idx} for img, idx in zip(encoded, indices)]
+        if any(times[i] > times[i + 1] for i in range(len(times) - 1)):
+            raise ValueError(
+                f"Flux3: keyframe_times müssen aufsteigend sein, bekommen: {times}"
+            )
+        if any(t < 0 for t in times):
+            raise ValueError(f"Flux3: keyframe_times dürfen nicht negativ sein: {times}")
+        encoded = await asyncio.to_thread(batch_to_base64, imgs)
+        return [[t, b64] for t, b64 in zip(times, encoded)]
 
+    if n >= 3 and duration_value == "auto":
+        # Spec: "3 or more need a set duration."
+        raise ValueError(
+            "Flux3: 3+ Keyframes ohne keyframe_times brauchen eine feste duration "
+            "(5–20). Stelle duration auf einen Wert, oder gib keyframe_times an."
+        )
 
-def _build_payload(mode: str, prompt: str, negative_prompt: str, seed: int,
-                   steps: int, guidance: float, prompt_upsampling: bool) -> dict:
-    payload = {"mode": mode, "prompt": prompt}
-    if negative_prompt.strip():
-        payload["negative_prompt"] = negative_prompt.strip()
-    if seed:
-        payload["seed"] = int(seed)
-    if steps:
-        payload["steps"] = int(steps)
-    if guidance:
-        payload["guidance"] = float(guidance)
-    if prompt_upsampling:
-        payload["prompt_upsampling"] = True
-    return payload
-
-
-class Flux3Image:
-    """Text-to-image (t2i) and image-to-image / edit (i2i)."""
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                **_common_inputs(),
-                "aspect_ratio": (IMAGE_ASPECT_RATIOS, {"default": "16:9"}),
-                "image_size": (IMAGE_SIZES, {"default": "1024sq",
-                                             "tooltip": "Größe als Quadrat-Äquivalent; "
-                                                        "aspect_ratio bestimmt die Form"}),
-            },
-            "optional": {
-                "images": ("IMAGE", {"tooltip": "Angeschlossen = i2i (Edit/Remix). "
-                                                "Bis zu 4 Bilder aus einem Batch."}),
-                "alpha": ("FLOAT", {
-                    "default": -1.0, "min": -1.0, "max": 100.0, "step": 0.01,
-                    "tooltip": "Undokumentierter Parameter der API (float). "
-                               "-1 = nicht senden / API-Default."}),
-                "timeout_minutes": ("INT", {
-                    "default": DEFAULT_TIMEOUT_MINUTES, "min": 1, "max": 240,
-                    "tooltip": "Wie lange die Node auf das Ergebnis wartet. Bei voller "
-                               "BFL-Warteschlange dauert ein Job schnell 20+ Minuten. "
-                               "Läuft die Zeit ab, bricht nur die Node ab — der Job läuft "
-                               "serverseitig weiter (und kostet trotzdem Credits)."}),
-                "discord_webhook_url": ("STRING", {
-                    "default": "",
-                    "tooltip": "Wenn gesetzt, postet diese Node nach der Generierung die nackte "
-                               "Task-ID in den Discord-Kanal (nichts sonst). Leer = aus .env "
-                               "(DISCORD_WEBHOOK_URL), sonst kein Versand."}),
-                "api_key": ("STRING", {"default": "", "tooltip": "Leer = aus .env"}),
-            },
-        }
-
-    RETURN_TYPES = ("IMAGE", "STRING")
-    RETURN_NAMES = ("image", "metadata")
-    FUNCTION = "generate"
-    CATEGORY = CATEGORY
-
-    async def generate(self, model, prompt, negative_prompt, seed, steps, guidance,
-                       prompt_upsampling, aspect_ratio, image_size, images=None,
-                       alpha=-1.0, timeout_minutes=DEFAULT_TIMEOUT_MINUTES,
-                       discord_webhook_url="", api_key=""):
-        if not prompt.strip():
-            raise ValueError("Flux3: prompt darf nicht leer sein.")
-
-        mode = "i2i" if images is not None else "t2i"
-        payload = _build_payload(mode, prompt, negative_prompt, seed, steps,
-                                 guidance, prompt_upsampling)
-        payload["aspect_ratio"] = aspect_ratio
-        payload["image_size"] = image_size
-        if alpha >= 0:
-            payload["alpha"] = float(alpha)
-
-        if images is not None:
-            # The old "1 to 4 reference images" cap was lifted; the API now takes more.
-            encoded = await asyncio.to_thread(batch_to_base64, images)
-            payload["input_image"] = encoded if len(encoded) > 1 else encoded[0]
-
-        client = Flux3Client(api_key)
-        task, result, data = await _run(client, model, payload, timeout_minutes)
-        await _notify_discord(discord_webhook_url, task)
-        return (bytes_to_image_tensor(data), format_metadata(model, payload, result, task))
+    encoded = await asyncio.to_thread(batch_to_base64, imgs)
+    if n == 1:
+        return encoded[0]
+    return encoded  # list[str]: 2 -> start+end, 3+ -> evenly spread
 
 
 class Flux3Video:
-    """All video modes: t2v, i2v, ii2v, ir2v, k2v, f2v, ve2v, vr2v, t2v_sdedit."""
+    """FLUX 3 Video — t2v / i2v / v2v / draft_enhance, mit synchronem Audio."""
 
     @classmethod
     def INPUT_TYPES(cls):
-        inputs = _common_inputs()
-        inputs["model"] = (VIDEO_MODELS, {
-            "default": "flux-3-large",
-            "tooltip": "large = volle Qualität · distilled = schnell · "
-                       "flux-3-preview-high = eigener Endpunkt auf api.bfl.ai: NUR Text→Video "
-                       "(mode/Bilder/Videos, steps, guidance, negative_prompt, audio, alpha "
-                       "werden dort nicht unterstützt; nur 480p/720p, kein 2s)",
-        })
         return {
             "required": {
-                **inputs,
                 "mode": (VIDEO_MODES, {
                     "default": "t2v",
                     "tooltip": "t2v: Text→Video · "
-                               "i2v: 1 Bild als Startframe → Video · "
-                               "ii2v: Start- UND Endbild → Video dazwischen · "
-                               "ir2v: Referenzbilder → Video (früher i2v_ref) · "
-                               "k2v: Keyframes an festen Frame-Positionen → Video · "
-                               "f2v: Clip aus seinen ersten Frames fortsetzen · "
-                               "ve2v: Video editieren → Video (früher v2v) · "
-                               "vr2v: Video als Referenz → Video (früher v2v) · "
-                               "t2v_sdedit: Clip neu verrauschen & denoisen (ohne Audio)",
-                }),
-                "aspect_ratio": (["auto"] + VIDEO_ASPECT_RATIOS, {
-                    "default": "16:9",
-                    "tooltip": "'auto' nur bei flux-3-preview-high: die API wählt anhand von "
-                               "Prompt und Referenzen."}),
-                "duration": (["auto"] + VIDEO_DURATIONS, {
-                    "default": "5s",
-                    "tooltip": "'auto' nur bei flux-3-preview-high. 2s gibt es dort nicht, "
-                               "und ii2v braucht eine feste Länge."}),
-                "video_resolution": (VIDEO_RESOLUTIONS, {
-                    "default": "720p",
-                    "tooltip": "flux-3-preview-high kennt nur 480p und 720p."}),
-                "audio": ("BOOLEAN", {
+                               "i2v: Bild(er)→Video (keyframes) · "
+                               "v2v: Clip fortsetzen (start_video) · "
+                               "draft_enhance: einen vorherigen draft final rendern."}),
+                "prompt": ("STRING", {
+                    "multiline": True, "default": "",
+                    "tooltip": "Pflicht für t2v/i2v/v2v. Bei draft_enhance nicht "
+                               "erlaubt — der draft_cache pins alles."}),
+                "aspect_ratio": (ASPECT_RATIOS, {
+                    "default": "auto",
+                    "tooltip": "'auto' läßt die API anhand von Prompt und Referenzen wählen."}),
+                "duration": (DURATIONS, {
+                    "default": "auto",
+                    "tooltip": "Ganze Sekunden 5–20, oder 'auto'. 3+ Keyframes ohne "
+                               "keyframe_times brauchen eine feste Länge."}),
+                "resolution": (RESOLUTIONS, {
+                    "default": "hd",
+                    "tooltip": "hd = Default · fhd = höhere Auflösung (Video-Upscaler)."}),
+                "generate_audio": ("BOOLEAN", {
                     "default": True,
-                    "tooltip": "Bei preview-high = generate_audio. Wird bei t2v_sdedit "
-                               "ignoriert (kein Audio)."}),
-            },
-            "optional": {
-                "image": ("IMAGE", {
-                    "tooltip": "i2v: 1 Bild (Startframe) · ii2v: Startbild · "
-                               "ir2v: Referenzbilder (Batch) · k2v: Keyframes (Batch)"}),
-                "end_image": ("IMAGE", {"tooltip": "Nur ii2v: das Zielbild am Ende des Clips"}),
-                "video": ("VIDEO", {"tooltip": "Für f2v, ve2v, vr2v und t2v_sdedit"}),
-                "keyframe_indices": ("STRING", {
-                    "default": "",
-                    "tooltip": "Nur k2v: Frame-Positionen der Keyframes, kommagetrennt "
-                               "(z.B. '0, 24, 48'). Muss so viele Werte haben wie Bilder "
-                               "am image-Input hängen. 24 fps."}),
-                "start_step": ("INT", {"default": 0, "min": 0, "max": 50,
-                                       "tooltip": "Nur t2v_sdedit: ab welchem Step neu denoised "
-                                                  "wird (0 = API-Default). Niedriger = stärkere "
-                                                  "Veränderung."}),
-                "alpha": ("FLOAT", {
-                    "default": -1.0, "min": -1.0, "max": 100.0, "step": 0.01,
-                    "tooltip": "Undokumentierter Parameter der API (float, keine Grenzen). "
-                               "-1 = nicht senden / API-Default."}),
-                "conditioning_noise": ("FLOAT", {
-                    "default": -1.0, "min": -1.0, "max": 10.0, "step": 0.01,
-                    "tooltip": "Nur i2v, ii2v, ir2v, k2v, f2v: Rauschen auf dem Eingangsbild "
-                               "(>= 0). -1 = nicht senden / API-Default. 0 = kein Rauschen."}),
-                "grounding": ("BOOLEAN", {
-                    "default": True,
-                    "tooltip": "Nur flux-3-preview-high: kurzer Recherche-Schritt vor der "
-                               "Generierung. Default an."}),
+                    "tooltip": "Default an. Aus = stummer Clip."}),
+                "safety_tolerance": ("INT", {
+                    "default": SAFETY_TOLERANCE_DEFAULT,
+                    "min": SAFETY_TOLERANCE_MIN, "max": SAFETY_TOLERANCE_MAX,
+                    "tooltip": "0 (strengste) bis 4. Default 2. Mit Conditioning-Media "
+                               "maximal 2."}),
+                "draft": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Schnelle hd-Vorschau. Das Ergebnis enthält einen "
+                               "draft_cache, den man mit mode=draft_enhance final "
+                               "rendern kann."}),
                 "version": ("STRING", {
                     "default": "latest",
-                    "tooltip": "Nur flux-3-preview-high: 'latest' bekommt automatisch "
-                               "Verbesserungen; eine feste Version hält das Verhalten stabil "
-                               "(nötig für exakt reproduzierbare Seeds)."}),
+                    "tooltip": "Aktuell nur 'latest' freigegeben."}),
+            },
+            "optional": {
+                "images": ("IMAGE", {
+                    "tooltip": "Nur i2v: 1 Bild (Startframe) · 2 Bilder (Start+Ende) · "
+                               "3–10 Bilder (gleichmäßig verteilt, braucht duration) · "
+                               "oder zusammen mit keyframe_times (Storyboard)."}),
+                "end_image": ("IMAGE", {
+                    "tooltip": "Nur i2v: wenn gesetzt, gelten images=Start und "
+                               "end_image=Ende (genau 2 Keyframes)."}),
+                "keyframe_times": ("STRING", {
+                    "default": "",
+                    "tooltip": "Nur i2v: Sekunden je Bild, kommagetrennt (z.B. '0, 4.5, 10'). "
+                               "Anzahl muss mit images übereinstimmen, Werte aufsteigend. "
+                               "Bilder werden zu Frames an diesen Sekunden."}),
+                "video": ("VIDEO", {
+                    "tooltip": "Nur v2v: der Clip, der fortgesetzt wird (mp4)."}),
+                "draft_cache": ("STRING", {
+                    "default": "",
+                    "tooltip": "Nur draft_enhance: base64-Bundle oder URL aus dem "
+                               "draft-Output eines vorherigen Laufs. Pflicht für diesen Modus."}),
                 "timeout_minutes": ("INT", {
                     "default": DEFAULT_TIMEOUT_MINUTES, "min": 1, "max": 240,
                     "tooltip": "Wie lange die Node auf das Ergebnis wartet. Bei voller "
                                "BFL-Warteschlange dauert ein Job schnell 20+ Minuten. "
                                "Läuft die Zeit ab, bricht nur die Node ab — der Job läuft "
                                "serverseitig weiter (und kostet trotzdem Credits)."}),
-                "discord_webhook_url": ("STRING", {
-                    "default": "",
-                    "tooltip": "Wenn gesetzt, postet diese Node nach der Generierung die nackte "
-                               "Task-ID in den Discord-Kanal (nichts sonst). Leer = aus .env "
-                               "(DISCORD_WEBHOOK_URL), sonst kein Versand."}),
                 "api_key": ("STRING", {"default": "", "tooltip": "Leer = aus .env"}),
             },
         }
@@ -410,148 +196,113 @@ class Flux3Video:
     FUNCTION = "generate"
     CATEGORY = CATEGORY
 
-    async def generate(self, model, prompt, negative_prompt, seed, steps, guidance,
-                       prompt_upsampling, mode, aspect_ratio, duration, video_resolution,
-                       audio, image=None, end_image=None, video=None, keyframe_indices="",
-                       start_step=0, alpha=-1.0, conditioning_noise=-1.0,
-                       grounding=True, version="latest",
-                       timeout_minutes=DEFAULT_TIMEOUT_MINUTES,
-                       discord_webhook_url="", api_key=""):
-        if not prompt.strip():
-            raise ValueError("Flux3: prompt darf nicht leer sein.")
+    async def generate(self, mode, prompt, aspect_ratio, duration, resolution,
+                       generate_audio, safety_tolerance, draft, version,
+                       images=None, end_image=None, keyframe_times="", video=None,
+                       draft_cache="",
+                       timeout_minutes=DEFAULT_TIMEOUT_MINUTES, api_key=""):
+        if mode not in VIDEO_MODES:
+            raise ValueError(
+                f"Flux3: Modus '{mode}' nicht unterstützt. Erlaubt: {', '.join(VIDEO_MODES)}.")
 
-        # flux-3-preview-high: no `mode` field - the input field you fill decides.
-        if ENDPOINTS[model]["schema"] == "preview":
-            payload = _build_preview_payload(
-                mode, prompt, seed, aspect_ratio, duration, video_resolution,
-                audio, grounding, version,
-                ignored={
-                    "negative_prompt": bool(negative_prompt.strip()),
-                    "steps": bool(steps),
-                    "guidance": bool(guidance),
-                    "prompt_upsampling": bool(prompt_upsampling),
-                    "alpha": alpha >= 0,
-                    "conditioning_noise": conditioning_noise >= 0,
-                },
-            )
-            field = PREVIEW_MODE_TO_FIELD[mode]
+        # --- draft_enhance: only mode, draft_cache, safety_tolerance are accepted.
+        if mode == "draft_enhance":
+            cache = draft_cache.strip()
+            if not cache:
+                raise ValueError(
+                    "Flux3: draft_enhance braucht draft_cache (base64-Bundle oder URL "
+                    "aus einem vorherigen draft-Lauf)."
+                )
+            payload = {
+                "mode": "draft_enhance",
+                "draft_cache": cache,
+                "safety_tolerance": int(safety_tolerance),
+            }
+            # The bundle pins everything else; the API rejects any further field
+            # (additionalProperties: false). Warn about inputs that would be silently dropped.
+            ignored = [n for n, used in (
+                ("prompt", bool(prompt.strip())),
+                ("images", images is not None),
+                ("end_image", end_image is not None),
+                ("keyframe_times", bool(keyframe_times.strip())),
+                ("video", video is not None),
+                ("aspect_ratio", aspect_ratio != "auto"),
+                ("duration", duration != "auto"),
+                ("resolution", resolution != "hd"),
+                ("generate_audio", not generate_audio),
+                ("draft", draft),
+                ("version", version.strip() not in ("", "latest")),
+            ) if used]
+            if ignored:
+                log.warning("Flux3: draft_enhance akzeptiert nur draft_cache + safety_tolerance. "
+                            "Diese Inputs werden ignoriert: %s", ", ".join(ignored))
+        else:
+            if not prompt.strip():
+                raise ValueError("Flux3: prompt darf nicht leer sein.")
 
-            if field == "keyframes":
-                if image is None:
-                    raise ValueError(f"Flux3: Modus '{mode}' braucht einen image-Input.")
-                _check_preview_images(image, "keyframes")
-                imgs = image
-                if mode == "ii2v":
-                    if end_image is None:
-                        raise ValueError(
-                            f"Flux3: '{mode}' braucht zusätzlich einen end_image-Input "
-                            f"(image = Startbild, end_image = Zielbild)."
-                        )
-                    imgs = torch.cat([image[:1], end_image[:1]])
-                encoded = await asyncio.to_thread(batch_to_base64, imgs)
-                payload["keyframes"] = _preview_keyframes(
-                    mode, encoded, payload["duration"], keyframe_indices)
+            payload: dict = {"mode": mode, "prompt": prompt.strip()}
 
-            elif field == "reference_images":
-                if image is None:
-                    raise ValueError(f"Flux3: Modus '{mode}' braucht einen image-Input.")
-                _check_preview_images(image, "reference_images")
-                if len(image) > PREVIEW_MAX_REFERENCE_IMAGES:
-                    raise ValueError(
-                        f"Flux3: reference_images nimmt höchstens "
-                        f"{PREVIEW_MAX_REFERENCE_IMAGES} Bilder, der Batch hat {len(image)}."
-                    )
-                payload["reference_images"] = await asyncio.to_thread(batch_to_base64, image)
+            if aspect_ratio not in ASPECT_RATIOS:
+                raise ValueError(
+                    f"Flux3: aspect_ratio '{aspect_ratio}' nicht unterstützt. "
+                    f"Erlaubt: {', '.join(ASPECT_RATIOS)}."
+                )
+            payload["aspect_ratio"] = aspect_ratio
 
-            elif field in ("edit_video", "reference_video", "start_video"):
+            # duration: "auto" oder int 5..20
+            if duration not in DURATIONS:
+                raise ValueError(
+                    f"Flux3: duration '{duration}' nicht unterstützt. "
+                    f"Erlaubt: auto oder ganze Sekunden 5–20."
+                )
+            payload["duration"] = duration if duration == "auto" else int(duration)
+
+            if resolution not in RESOLUTIONS:
+                raise ValueError(
+                    f"Flux3: resolution '{resolution}' nicht unterstützt. "
+                    f"Erlaubt: {', '.join(RESOLUTIONS)}."
+                )
+            payload["resolution"] = resolution
+
+            payload["generate_audio"] = bool(generate_audio)
+
+            if not (SAFETY_TOLERANCE_MIN <= safety_tolerance <= SAFETY_TOLERANCE_MAX):
+                raise ValueError(
+                    f"Flux3: safety_tolerance muss {SAFETY_TOLERANCE_MIN}..{SAFETY_TOLERANCE_MAX} "
+                    f"sein, bekommen: {safety_tolerance}."
+                )
+            payload["safety_tolerance"] = int(safety_tolerance)
+
+            if draft:
+                payload["draft"] = True
+
+            v = version.strip()
+            if v and v != "latest":
+                # Spec enum currently only allows "latest"; keep the field ready for dated tags.
+                payload["version"] = v
+
+            # --- mode-specific conditioning input ---
+            if mode == "i2v":
+                payload["keyframes"] = await _build_keyframes(
+                    images, end_image, keyframe_times, duration)
+
+            elif mode == "v2v":
                 if video is None:
-                    raise ValueError(f"Flux3: Modus '{mode}' braucht einen video-Input.")
-                _check_preview_video(video)
-                payload[field] = await asyncio.to_thread(video_to_base64, video)
+                    raise ValueError("Flux3: v2v braucht einen video-Input (start_video).")
+                payload["start_video"] = await asyncio.to_thread(video_to_base64, video)
 
-            client = Flux3Client(api_key)
-            task, result, data = await _run(client, model, payload, timeout_minutes)
-            await _notify_discord(discord_webhook_url, task)
-            return (VideoFromFile(io.BytesIO(data)),
-                    format_metadata(model, payload, result, task))
-
-        needs_image = mode in MODES_ONE_IMAGE + MODES_MANY_IMAGES + MODES_START_END
-        needs_video = mode in MODES_VIDEO
-        if needs_image and image is None:
-            raise ValueError(f"Flux3: Modus '{mode}' braucht einen image-Input.")
-        if needs_video and video is None:
-            raise ValueError(f"Flux3: Modus '{mode}' braucht einen video-Input.")
-        if mode in MODES_START_END and end_image is None:
-            raise ValueError(f"Flux3: Modus '{mode}' braucht zusätzlich einen end_image-Input "
-                             f"(image = Startbild, end_image = Zielbild).")
-
-        payload = _build_payload(mode, prompt, negative_prompt, seed, steps,
-                                 guidance, prompt_upsampling)
-        payload["aspect_ratio"] = aspect_ratio
-        payload["duration"] = duration
-        payload["video_resolution"] = video_resolution
-
-        # t2v_sdedit is the one video mode without an audio field.
-        if mode != "t2v_sdedit":
-            payload["audio"] = bool(audio)
-        elif start_step:
-            payload["start_step"] = int(start_step)
-
-        if alpha >= 0:
-            payload["alpha"] = float(alpha)
-        # Only send fields the mode actually has, so the debug output stays trustworthy.
-        if conditioning_noise >= 0 and mode in MODES_CONDITIONING_NOISE:
-            payload["conditioning_noise"] = float(conditioning_noise)
-
-        if mode in MODES_ONE_IMAGE:
-            # i2v takes exactly one image (the API rejects a list outright).
-            if len(image) > 1:
-                log.warning("Flux3: i2v nimmt nur 1 Bild — es wird das erste des Batches "
-                            "verwendet (%d übergeben). Für mehrere Bilder: mode=ir2v.",
-                            len(image))
-            payload["input_image"] = await asyncio.to_thread(tensor_to_base64, image[0])
-
-        elif mode in MODES_START_END:
-            payload["start_image"] = await asyncio.to_thread(tensor_to_base64, image[0])
-            payload["end_image"] = await asyncio.to_thread(tensor_to_base64, end_image[0])
-
-        elif mode in MODES_MANY_IMAGES:
-            encoded = await asyncio.to_thread(batch_to_base64, image)
-            payload["input_image"] = encoded if len(encoded) > 1 else encoded[0]
-
-            if mode == "k2v":
-                try:
-                    indices = [int(x) for x in keyframe_indices.replace(";", ",").split(",")
-                               if x.strip()]
-                except ValueError as exc:
-                    raise ValueError(
-                        f"Flux3: keyframe_indices muss eine Liste ganzer Zahlen sein "
-                        f"(z.B. '0, 24, 48'), bekommen: {keyframe_indices!r}"
-                    ) from exc
-                if len(indices) != len(image):
-                    raise ValueError(
-                        f"Flux3: k2v braucht genau so viele keyframe_indices wie Bilder — "
-                        f"{len(image)} Bild(er), aber {len(indices)} Index/Indizes."
-                    )
-                payload["keyframe_indices"] = indices
-
-        if needs_video:
-            # Re-encoding a clip to base64 is slow and CPU-bound: keep it off the loop.
-            payload["input_video"] = await asyncio.to_thread(video_to_base64, video)
+            # t2v: no extra conditioning field.
 
         client = Flux3Client(api_key)
-        task, result, data = await _run(client, model, payload, timeout_minutes)
-        await _notify_discord(discord_webhook_url, task)
+        task, result, data = await _run(client, payload, timeout_minutes)
         return (VideoFromFile(io.BytesIO(data)),
-                format_metadata(model, payload, result, task))
+                format_metadata(payload, result, task))
 
 
 NODE_CLASS_MAPPINGS = {
-    "Flux3Image": Flux3Image,
     "Flux3Video": Flux3Video,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "Flux3Image": "Flux 3 Image (API)",
     "Flux3Video": "Flux 3 Video (API)",
 }
