@@ -1,20 +1,27 @@
 # Flux 3 API — ComfyUI Nodes
 
-ComfyUI node for the BFL Flux 3 video API.
+ComfyUI nodes for the BFL Flux 3 video API, plus an LLM-powered prompt generator.
 
-**Single endpoint:** `POST https://api.bfl.ai/v1/flux-3-video`
-([Docs](https://docs.bfl.ai/flux_3/flux3_video),
-[API reference](https://docs.bfl.ai/api-reference/utility/generate-a-video-with-flux-3)).
+## Nodes
+
+- **Flux 3 Video (API)** — generates video via `POST https://api.bfl.ai/v1/flux-3-video`
+  ([Docs](https://docs.bfl.ai/flux_3/flux3_video),
+  [API reference](https://docs.bfl.ai/api-reference/utility/generate-a-video-with-flux-3)).
+- **Flux 3 Openrouter Prompt** — turns a vague idea into a structured FLUX 3 prompt
+  using an OpenRouter LLM, guided by a prompting skill. Output feeds straight into
+  the Video node's `prompt` input.
 
 ## Setup
 
-Add your key to `.env`:
+Add your keys to `.env`:
 
 ```
 BFL_API_KEY=bfl_...
+OPENROUTER_API_KEY=sk-or-...
 ```
 
-The key is looked up in this order: node `api_key` field → `.env` → `BFL_API_KEY` environment variable.
+Get an OpenRouter key at https://openrouter.ai/keys. Keys are looked up in this
+order: node `api_key` field → `.env` → environment variable.
 
 Optional in `.env`:
 
@@ -24,9 +31,11 @@ BFL_BASE_URL=https://api.bfl.ai
 
 (Default is `https://api.bfl.ai`; only change it if BFL announces a different host.)
 
-## Node
+---
 
-**Flux 3 Video (API)** — outputs: `video` (mp4, with audio track) and `metadata`. Feed straight into `Save Video`.
+## Flux 3 Video (API)
+
+Outputs: `video` (mp4, with audio track) and `metadata`. Feed straight into `Save Video`.
 
 ### Modes (`mode`)
 
@@ -126,3 +135,39 @@ For this to hold, nothing may block the event loop: polling uses `await asyncio.
 all blocking parts (HTTP requests, base64 encoding of images/videos) run via
 `asyncio.to_thread()`. A single `time.sleep()` in the wrong place would re-serialise the whole
 graph.
+
+---
+
+## Flux 3 Openrouter Prompt
+
+Turns a plain-words idea into a complete, structured FLUX 3 prompt using an
+[OpenRouter](https://openrouter.ai) LLM. No variants, no metadata — just the
+prompt, ready to paste into the Video node.
+
+| Input | What it does |
+|---|---|
+| `idea` | Describe your video in plain words. |
+| `model` | OpenRouter model slug. The dropdown is filled **live** from the OpenRouter API; refresh ComfyUI to pick up new models. |
+| `skill` | Prompting skill that steers the LLM (see below). |
+| `images` | Optional: reference image(s) for vision-capable models (GPT-4o, Claude Sonnet, Gemini, …). |
+| `model_custom` | Optional: any OpenRouter slug not in the dropdown. |
+| `api_key` | Optional override; empty = from `.env` (`OPENROUTER_API_KEY`). |
+| `extra_instructions` | Optional directives appended to the skill. |
+| `temperature` | LLM sampling temperature (0–2). |
+| `max_tokens` | Max output tokens. |
+| `timeout_seconds` | How long to wait for the LLM. |
+
+**Output:** `prompt` (STRING) — feed it into the Flux 3 Video node's `prompt` input.
+
+### Skills
+
+Skills are `.md` files in the `skills/` folder. Two are pre-installed:
+
+- **Flux3Director** — full structured prompting skill for FLUX 3 video (all modes,
+  multi-segment timing, camera vocabulary, tag system).
+- **Flux3Director4Discord** — the same skill compressed for the FLUX3 Discord bot's
+  2,000-character hard limit.
+
+**Add your own:** drop any `.md` file into the `skills/` folder and refresh
+ComfyUI — it shows up in the `skill` dropdown automatically. Set `skill` to
+`none` for freeform prompting without a skill.
