@@ -1,12 +1,18 @@
-"""ComfyUI node for the BFL Flux 3 Video API (POST /v1/flux-3-video).
+"""ComfyUI nodes for the BFL Flux 3 API.
 
-Single documented endpoint, four modes: t2v, i2v, v2v, draft_enhance.
+Flux3Video — documented endpoint POST /v1/flux-3-video, four modes
+(t2v / i2v / v2v / draft_enhance).
 Spec: https://docs.bfl.ai/api-reference/utility/generate-a-video-with-flux-3
+
+Flux3Prompter — LLM-powered prompt generator (OpenRouter) that turns a vague
+idea into a structured FLUX 3 prompt, guided by a prompting skill.
 """
 
 import asyncio
+import glob
 import io
 import logging
+import os
 from typing import Any
 
 import torch
@@ -29,6 +35,14 @@ from .flux3_client import (
     format_metadata,
     tensor_to_base64,
     video_to_base64,
+)
+from .llm_client import (
+    DEFAULT_MODEL as OR_DEFAULT_MODEL,
+    call_openrouter,
+    fetch_openrouter_models,
+    get_api_key as get_openrouter_api_key,
+    is_vision_model,
+    tensor_to_base64 as image_to_base64,
 )
 
 log = logging.getLogger("Flux3API")
@@ -299,10 +313,173 @@ class Flux3Video:
                 format_metadata(payload, result, task))
 
 
+# ===========================================================================
+# Flux3Prompter — LLM-powered prompt generator (OpenRouter)
+# ===========================================================================
+
+_SKILLS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills")
+
+_PROMPTER_SYSTEM_FRAME = (
+    "You are helping a ComfyUI user craft a FLUX 3 video generation prompt.\n"
+    "Follow the prompting skill below exactly — its structure, section format, "
+    "tag system, timing rules, camera vocabulary, and output standard.\n"
+    "Turn the user's idea into a complete, ready-to-paste FLUX 3 prompt.\n\n"
+    "IMPORTANT OVERRIDE OF THE SKILL'S OUTPUT STANDARD:\n"
+    "- Output ONLY the single main prompt. No style variants, no alternative versions.\n"
+    "- No pacing recommendations, no dialogue word counts, no delta summaries,\n"
+    "  no character counts, no metadata of any kind.\n"
+    "- No preamble, no explanation, no commentary before or after the prompt.\n"
+    "- The entire output must be the prompt itself and nothing else — ready to\n"
+    "  paste directly into a FLUX 3 generation node.\n"
+)
+
+
+def _list_skills() -> list[str]:
+    names = ["none"]
+    if os.path.isdir(_SKILLS_DIR):
+        for path in sorted(glob.glob(os.path.join(_SKILLS_DIR, "*.md"))):
+            names.append(os.path.splitext(os.path.basename(path))[0])
+    return names
+
+
+def _load_skill(name: str) -> str:
+    if not name or name == "none":
+        return ""
+    path = os.path.join(_SKILLS_DIR, f"{name}.md")
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"Flux3Prompt: skill '{name}' nicht gefunden in {_SKILLS_DIR}.")
+    with open(path, "r", encoding="utf-8-sig") as fh:
+        return fh.read().strip()
+
+
+def _model_dropdown() -> list[str]:
+    models = fetch_openrouter_models()
+    if OR_DEFAULT_MODEL in models:
+        models = [OR_DEFAULT_MODEL] + [m for m in models if m != OR_DEFAULT_MODEL]
+    return models
+
+
+class Flux3Prompter:
+    """LLM-powered FLUX 3 prompt generator (OpenRouter)."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "idea": ("STRING", {
+                    "multiline": True, "default": "",
+                    "tooltip": "Describe your video idea in plain words. The LLM "
+                               "turns it into a structured FLUX 3 prompt."}),
+                "model": (_model_dropdown(), {
+                    "default": OR_DEFAULT_MODEL,
+                    "tooltip": "OpenRouter model slug. List wird live von der "
+                               "OpenRouter-API geladen (text-only Modelle). Refresh "
+                               "ComfyUI, um neu hinzugekommene Modelle zu sehen."}),
+                "skill": (_list_skills(), {
+                    "default": "none",
+                    "tooltip": "Prompting skill that steers the LLM. 'none' = freeform. "
+                               "Bundled: Flux3Director, Flux3Director4Discord. "
+                               "Drop extra .md files into the skills/ folder and "
+                               "refresh ComfyUI to add your own."}),
+            },
+            "optional": {
+                "images": ("IMAGE", {
+                    "tooltip": "Optional reference image(s) for the LLM to see — "
+                               "the model must be vision-capable (e.g. GPT-4o, "
+                               "Claude Sonnet, Gemini). The image is sent as base64 "
+                               "alongside your idea; describe it in the idea text."}),
+                "model_custom": ("STRING", {
+                    "default": "",
+                    "tooltip": "Optional: beliebiger OpenRouter-Model-Slug, der nicht "
+                               "im Dropdown steht. Hat Vorrang vor dem model-Dropdown."}),
+                "api_key": ("STRING", {
+                    "default": "",
+                    "tooltip": "Leer = aus .env / Umgebungsvariable "
+                               "OPENROUTER_API_KEY."}),
+                "extra_instructions": ("STRING", {
+                    "multiline": True, "default": "",
+                    "tooltip": "Optional: extra directives appended to the skill "
+                               "(z.B. 'make it 10s, 2 segments, dialogue in German')."}),
+                "temperature": ("FLOAT", {
+                    "default": 0.7, "min": 0.0, "max": 2.0, "step": 0.05,
+                    "tooltip": "LLM sampling temperature. Lower = deterministic, "
+                               "higher = creative."}),
+                "max_tokens": ("INT", {
+                    "default": 4096, "min": 256, "max": 32000,
+                    "tooltip": "Max output tokens."}),
+                "timeout_seconds": ("INT", {
+                    "default": 120, "min": 10, "max": 600,
+                    "tooltip": "Wie lange die Node auf die LLM-Antwort wartet."}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("prompt",)
+    FUNCTION = "generate"
+    CATEGORY = CATEGORY
+
+    async def generate(self, idea, model, skill,
+                       model_custom="", api_key="", extra_instructions="",
+                       temperature=0.7, max_tokens=4096, timeout_seconds=120,
+                       images=None, **kwargs):
+        if not idea.strip():
+            raise ValueError("Flux3Prompt: idea darf nicht leer sein.")
+
+        key = get_openrouter_api_key(api_key)
+
+        custom = (model_custom or "").strip()
+        if custom == "(provider default)":
+            custom = ""
+        chosen = custom if custom else model
+
+        image_blobs: list[str] | None = None
+        if images is not None:
+            if not is_vision_model(chosen):
+                log.warning("Flux3Prompt: model '%s' unterstützt vermutlich keine "
+                            "Bilder. Nutze ein Vision-Modell für Reference-Images.", chosen)
+            image_blobs = await asyncio.to_thread(
+                lambda imgs: [image_to_base64(im) for im in imgs], images)
+            log.info("Flux3Prompt: %d reference image(s) attached.", len(image_blobs))
+
+        skill_text = _load_skill(skill) if skill and skill != "none" else ""
+        parts = [_PROMPTER_SYSTEM_FRAME]
+        if skill_text:
+            parts.append("--- PROMPTING SKILL ---\n" + skill_text)
+        else:
+            parts.append("(No skill selected — produce a clean, vivid FLUX 3 prompt.)")
+        if extra_instructions.strip():
+            parts.append("--- ADDITIONAL INSTRUCTIONS ---\n" + extra_instructions.strip())
+        if image_blobs:
+            parts.append(
+                "--- REFERENCE IMAGES ---\n"
+                "One or more reference images are attached to the user message. "
+                "Describe how they should inform the FLUX 3 prompt — e.g. which "
+                "image defines a character's appearance, which defines a style, "
+                "which is a keyframe. Reference them in the Cast / Setting / Look "
+                "sections using the image's visual content.")
+        system = "\n\n".join(parts)
+
+        user = f"Video idea:\n{idea.strip()}"
+
+        log.info("Flux3Prompt: calling OpenRouter (model=%s, skill=%s, %.0f tokens max, images=%s)",
+                 chosen, skill, max_tokens, len(image_blobs) if image_blobs else 0)
+
+        text = await asyncio.to_thread(
+            call_openrouter, key, chosen, system, user,
+            temperature, max_tokens, timeout_seconds, image_blobs,
+        )
+
+        if not text:
+            raise RuntimeError("Flux3Prompt: LLM returned an empty response.")
+        return (text,)
+
+
 NODE_CLASS_MAPPINGS = {
     "Flux3Video": Flux3Video,
+    "Flux3Prompter": Flux3Prompter,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "Flux3Video": "Flux 3 Video (API)",
+    "Flux3Prompter": "Flux 3 Openrouter Prompt",
 }
