@@ -1,20 +1,20 @@
 # Flux 3 API — ComfyUI Nodes
 
-ComfyUI-Node für die BFL Flux-3-Video-API.
+ComfyUI node for the BFL Flux 3 video API.
 
-**Ein Endpunkt:** `POST https://api.bfl.ai/v1/flux-3-video`
-([Doku](https://docs.bfl.ai/flux_3/flux3_video),
-[API-Referenz](https://docs.bfl.ai/api-reference/utility/generate-a-video-with-flux-3)).
+**Single endpoint:** `POST https://api.bfl.ai/v1/flux-3-video`
+([Docs](https://docs.bfl.ai/flux_3/flux3_video),
+[API reference](https://docs.bfl.ai/api-reference/utility/generate-a-video-with-flux-3)).
 
 ## Setup
 
-Key in `.env` eintragen:
+Add your key to `.env`:
 
 ```
 BFL_API_KEY=bfl_...
 ```
 
-Der Key wird in dieser Reihenfolge gesucht: `api_key`-Feld der Node → `.env` → Umgebungsvariable `BFL_API_KEY`.
+The key is looked up in this order: node `api_key` field → `.env` → `BFL_API_KEY` environment variable.
 
 Optional in `.env`:
 
@@ -22,57 +22,57 @@ Optional in `.env`:
 BFL_BASE_URL=https://api.bfl.ai
 ```
 
-(Default ist `https://api.bfl.ai`; nur ändern, wenn BFL einen anderen Host bekannt gibt.)
+(Default is `https://api.bfl.ai`; only change it if BFL announces a different host.)
 
 ## Node
 
-**Flux 3 Video (API)** — Ausgaben: `video` (mp4, mit Audiospur) und `metadata`. Direkt an `Save Video` hängen.
+**Flux 3 Video (API)** — outputs: `video` (mp4, with audio track) and `metadata`. Feed straight into `Save Video`.
 
-### Modi (`mode`)
+### Modes (`mode`)
 
-Ein Modus pro Request; der Rest des Requests bleibt gleich.
+One mode per request; the rest of the request stays the same.
 
-| mode | braucht | macht |
+| mode | requires | does |
 |---|---|---|
 | `t2v` | – | Text → Video |
-| `i2v` | `images` (1–10) | Bild(er) → Video (keyframes) |
-| `v2v` | `video` | Clip fortsetzen (start_video) |
-| `draft_enhance` | `draft_cache` | einen vorherigen `draft`-Lauf final rendern |
+| `i2v` | `images` (1–10) | Image(s) → Video (keyframes) |
+| `v2v` | `video` | Continue a clip (start_video) |
+| `draft_enhance` | `draft_cache` | Final-render a previous `draft` run |
 
-### Parameter
+### Parameters
 
-| Feld | Pflicht | Werte |
+| Field | Required | Values |
 |---|---|---|
-| `mode` | immer | `t2v` `i2v` `v2v` `draft_enhance` |
-| `prompt` | t2v/i2v/v2v | frei |
-| `keyframes` | i2v | 1 Bild (Startframe) · 2 Bilder (Start+Ende) · 3–10 Bilder (gleichmäßig, braucht `duration`) · oder `[sekunden, bild]`-Paare (Storyboard). URL oder base64. |
-| `start_video` | v2v | mp4 URL oder base64 |
-| `draft_cache` | draft_enhance | base64-Bundle oder URL aus dem `draft`-Output eines vorherigen Laufs |
-| `aspect_ratio` | – | `auto` (Default), `21:9`, `2:1`, `16:9`, `4:3`, `1:1`, `3:4`, `9:16` |
-| `duration` | – | ganze Sekunden 5–20 oder `auto` (Default) |
-| `resolution` | – | `hd` (Default) oder `fhd` |
-| `generate_audio` | – | bool, Default `true` |
-| `safety_tolerance` | – | 0 (strengste) bis 4, Default 2. Mit Conditioning-Media maximal 2. |
-| `draft` | – | bool. `true` = schnelle hd-Vorschau; Ergebnis enthält einen `draft_cache`. |
-| `version` | – | `latest` (Default) |
+| `mode` | always | `t2v` `i2v` `v2v` `draft_enhance` |
+| `prompt` | t2v/i2v/v2v | free-form |
+| `keyframes` | i2v | 1 image (opening frame) · 2 images (start+end) · 3–10 images (evenly spread, needs `duration`) · or `[seconds, image]` pairs (storyboard). URL or base64. |
+| `start_video` | v2v | mp4 URL or base64 |
+| `draft_cache` | draft_enhance | base64 bundle or URL from the `draft` output of a previous run |
+| `aspect_ratio` | – | `auto` (default), `21:9`, `2:1`, `16:9`, `4:3`, `1:1`, `3:4`, `9:16` |
+| `duration` | – | whole seconds 5–20 or `auto` (default) |
+| `resolution` | – | `hd` (default) or `fhd` |
+| `generate_audio` | – | bool, default `true` |
+| `safety_tolerance` | – | 0 (strictest) to 4, default 2. Capped at 2 when conditioning media is present. |
+| `draft` | – | bool. `true` = fast hd preview; result includes a `draft_cache`. |
+| `version` | – | `latest` (default) |
 
-`draft_enhance` akzeptiert **nur** `mode`, `draft_cache` und `safety_tolerance` — der Bundle pins
-Modus, Prompt, Seed und Conditioning. Alle anderen Inputs werden ignoriert (mit Konsolenwarnung).
+`draft_enhance` accepts **only** `mode`, `draft_cache` and `safety_tolerance` — the bundle pins
+mode, prompt, seed and conditioning. All other inputs are ignored (with a console warning).
 
-### i2v keyframes (ComfyUI-UX)
+### i2v keyframes (ComfyUI UX)
 
-Die Node übersetzt die ComfyUI-Inputs in das dokumentierte `keyframes`-Schema:
+The node translates ComfyUI inputs into the documented `keyframes` schema:
 
-| was angeschlossen | keyframe_times | gesendet |
+| what's connected | keyframe_times | sent |
 |---|---|---|
-| 1 Bild | – | `"<base64>"` (Startframe) |
-| 2 Bilder *oder* `images`+`end_image` | – | `["<a>", "<b>"]` (Start+Ende) |
-| 3–10 Bilder | – | `["<a>", ...]` (gleichmäßig verteilt — `duration` muss gesetzt sein) |
-| n Bilder | n Sekunden | `[[t1, "<a>"], ...]` (Storyboard — Werte aufsteigend) |
+| 1 image | – | `"<base64>"` (opening frame) |
+| 2 images *or* `images`+`end_image` | – | `["<a>", "<b>"]` (start+end) |
+| 3–10 images | – | `["<a>", ...]` (evenly spread — `duration` must be set) |
+| n images | n seconds | `[[t1, "<a>"], ...]` (storyboard — values ascending) |
 
-### metadata-Output (Debug)
+### metadata output (debug)
 
-Der `STRING`-Output enthält alles zum Lauf — gedacht für eine *Show Any*-Node zum Debuggen. Ungekürzt:
+The `STRING` output contains everything about the run — meant for a *Show Any* node for debugging. Untruncated:
 
 ```
 === FLUX 3 VIDEO ===
@@ -80,7 +80,7 @@ endpoint       : POST https://api.bfl.ai/v1/flux-3-video
 task_id        : e696c5eb-e97a-484f-9976-d7a5722658b2
 polling_url    : https://api.bfl.ai/v1/get_result?id=e696c5eb-…
 
---- REQUEST (an die API gesendet) ---
+--- REQUEST (sent to the API) ---
 mode           : i2v
 prompt         : a seed grows into a tree through the seasons
 duration       : 10
@@ -88,41 +88,41 @@ resolution     : hd
 generate_audio : True
 keyframes      : [[0, <base64, 412 KB>], [10, <base64, 398 KB>]]
 
---- RESPONSE (von der API) ---
+--- RESPONSE (from the API) ---
 sample         : https://delivery.bfl.ai/results/…
 ```
 
-Base64-Bilder/-Videos/-Bundles werden als Größenangabe dargestellt statt als megabytelange Zeichenkette.
+Base64 images/videos/bundles are rendered as a size rather than a megabyte-long string.
 
-## Warteschlange / Timeout
+## Queue / Timeout
 
-Die BFL-Warteschlange kann bei Videos deutlich über 15 Minuten laufen. ComfyUI selbst hat **kein**
-Ausführungs-Timeout — es wartet beliebig lange. Begrenzt wird nur durch `timeout_minutes`
-(Default **45**, bis 240 einstellbar).
+The BFL queue can run well past 15 minutes for videos. ComfyUI itself has **no**
+execution timeout — it waits indefinitely. Only `timeout_minutes` caps it
+(default **45**, adjustable up to 240).
 
-Läuft die Zeit ab, bricht **nur die Node** ab; der Job läuft bei BFL weiter und kostet trotzdem
-Credits. Die Fehlermeldung enthält deshalb die `polling_url`, mit der sich das Ergebnis nachträglich
-abrufen lässt.
+If the time runs out, **only the node** aborts; the job keeps running at BFL and still costs
+credits. The error message therefore includes the `polling_url`, so the result can be fetched
+afterwards.
 
-Während des Wartens meldet die Konsole jede Minute den Status, damit ein langer Lauf nicht wie ein
-Hänger aussieht. Der Poll-Abstand wächst mit der Wartezeit (2 s bis max. 10 s) — bei 25 Minuten sind
-das 201 statt 750 Requests.
+While waiting, the console logs status every minute so a long run doesn't look hung. The poll
+interval grows with wait time (2 s up to max 10 s) — over 25 minutes that's 201 instead of 750
+requests.
 
-**Netzwerk-Aussetzer:** Das Polling überlebt sie. `requests` versucht von sich aus keinen einzigen
-Retry, sodass eine einzelne gekappte Keep-Alive-Verbindung (`RemoteDisconnected`) einen bereits
-bezahlten Job vernichtet hätte. Jetzt gilt: bis zu 5 automatische Retries pro Request (mit Backoff)
-und darüber hinaus bis zu 10 Fehlversuche in Folge, bevor aufgegeben wird. Retried werden nur GETs —
-ein wiederholter POST könnte den Job ein zweites Mal einreichen und doppelt abrechnen. Auch der
-Download des fertigen Assets wird bis zu 4× versucht, da die signierte Ergebnis-URL abläuft.
+**Network hiccups:** polling survives them. `requests` does no retries by default, so a single
+dropped keep-alive connection (`RemoteDisconnected`) would have killed an already-paid job.
+Now: up to 5 automatic retries per request (with backoff), and beyond that up to 10 consecutive
+failures before giving up. Only GETs are retried — a repeated POST could submit the job twice
+and double-charge. The finished-asset download is also retried up to 4×, since the signed
+result URL expires.
 
-## Parallele Läufe
+## Parallel runs
 
-Die Node ist **async** (`async def generate`). ComfyUI erkennt Coroutine-`FUNCTION`s, parkt eine
-wartende Node als `PENDING` und führt währenddessen andere Nodes aus. Mehrere Flux-Nodes in einem
-Graph generieren deshalb **gleichzeitig**, nicht nacheinander — die Wartezeit ist die des langsamsten
-Clips, nicht die Summe aller.
+The node is **async** (`async def generate`). ComfyUI recognises coroutine `FUNCTION`s, parks a
+waiting node as `PENDING` and runs other nodes meanwhile. Multiple Flux nodes in one graph
+therefore generate **simultaneously**, not one after another — the wait time is that of the
+slowest clip, not the sum of all.
 
-Damit das hält, darf nichts den Event-Loop blockieren: Das Polling nutzt `await asyncio.sleep()`, und
-alle blockierenden Teile (HTTP-Requests, Base64-Encoding von Bildern/Videos) laufen über
-`asyncio.to_thread()`. Ein einzelnes `time.sleep()` an der falschen Stelle würde den gesamten Graph
-wieder serialisieren.
+For this to hold, nothing may block the event loop: polling uses `await asyncio.sleep()`, and
+all blocking parts (HTTP requests, base64 encoding of images/videos) run via
+`asyncio.to_thread()`. A single `time.sleep()` in the wrong place would re-serialise the whole
+graph.
