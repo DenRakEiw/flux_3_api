@@ -136,6 +136,37 @@ def video_to_base64(video) -> str:
 
 # --------------------------------------------------------------------------- api
 
+def _parse_poll_response(resp, task_id: str) -> dict:
+    """Parse a get_result polling response, surfacing task failures correctly.
+
+    BFL's get_result returns a JSON polling-response body even for failed tasks
+    — e.g. HTTP 422 with {"status":"Error","details":{"error":"..."}}. Calling
+    raise_for_status() before parsing would discard that body and misclassify a
+    terminal task failure as a transient network error (10 futile retries,
+    then a confusing "network error"). Parse first; only fall back to
+    raise_for_status() when the body isn't JSON (a genuine transport/server
+    problem that is worth retrying).
+    """
+    try:
+        data = resp.json()
+    except ValueError:
+        # Non-JSON body (HTML error page, proxy error) = transport/server
+        # problem. raise_for_status classifies it for retry handling.
+        resp.raise_for_status()
+        raise
+    # Body parsed but no `status` field on a 4xx (except 429) = a validation
+    # error body (e.g. FastAPI's {"detail":[...]}), not a polling response.
+    # Surface it instead of polling forever on a terminal rejection.
+    if (400 <= resp.status_code < 500 and resp.status_code != 429
+            and "status" not in data):
+        raise RuntimeError(
+            f"Flux3: Polling von Task {task_id} abgelehnt (HTTP "
+            f"{resp.status_code}): "
+            f"{json.dumps(data, ensure_ascii=False)[:1000]}"
+        )
+    return data
+
+
 class Flux3Client:
     def __init__(self, api_key: str = "", base_url: str = ""):
         self.api_key = get_api_key(api_key)
@@ -229,8 +260,7 @@ class Flux3Client:
 
         while True:
             resp = self.session.get(polling_url, timeout=60)
-            resp.raise_for_status()
-            data = resp.json()
+            data = _parse_poll_response(resp, task_id)
             status = data.get("status")
 
             if status != last_status:
@@ -271,8 +301,7 @@ class Flux3Client:
         while True:
             def _fetch():
                 resp = self.session.get(polling_url, timeout=60)
-                resp.raise_for_status()
-                return resp.json()
+                return _parse_poll_response(resp, task_id)
 
             try:
                 data = await asyncio.to_thread(_fetch)
