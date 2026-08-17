@@ -35,9 +35,10 @@ from .flux3_client import (
     SAFETY_TOLERANCE_MIN,
     UPSCALE_CREATIVITY_MODES,
     UPSCALE_ENDPOINT_PATH,
-    UPSCALE_FACTOR_DEFAULT,
     UPSCALE_FACTOR_MAX,
     UPSCALE_FACTOR_MIN,
+    UPSCALE_TARGETS,
+    UPSCALE_TARGET_SHORT_SIDE,
     UPSCALE_VIDEO_MAX_MB,
     UPSCALE_VIDEO_MAX_SECONDS,
     VIDEO_MODES,
@@ -351,13 +352,14 @@ class Flux3VideoUpscale:
                                f"{UPSCALE_VIDEO_MAX_SECONDS} s und "
                                f"{UPSCALE_VIDEO_MAX_MB} MB. Alternativ "
                                "input_video_url verwenden."}),
-                "upscale_factor": ("FLOAT", {
-                    "default": UPSCALE_FACTOR_DEFAULT,
-                    "min": UPSCALE_FACTOR_MIN, "max": UPSCALE_FACTOR_MAX, "step": 0.1,
-                    "tooltip": "Skalierung relativ zur Source-Auflösung, "
-                               f"{UPSCALE_FACTOR_MIN}–{UPSCALE_FACTOR_MAX}. Default 2. "
-                               "Sehr hohe Source-Auflösungen werden unterhalb des "
-                               "Werts skaliert (Output max ~14.4 MP pro Frame)."}),
+                "target_resolution": (UPSCALE_TARGETS, {
+                    "default": "4K",
+                    "tooltip": "Ziel-Auflösung (Short Side). Die Node misst die "
+                               "Source-Dimension und berechnet den upscale_factor "
+                               "daraus (Faktor = target_short / min(w, h), "
+                               "auf 1.5–3.0 begrenzt). Erhält das Seitenverhältnis "
+                               "der Quelle. 1080p ≈ 1920×1080, 2K ≈ 2560×1440, "
+                               "4K ≈ 3840×2160 (jeweils 16:9)."}),
                 "creativity": (UPSCALE_CREATIVITY_MODES, {
                     "default": "creative",
                     "tooltip": "precise (0) = identitätserhaltend, scharf — für "
@@ -371,7 +373,9 @@ class Flux3VideoUpscale:
                     "default": "",
                     "tooltip": "Alternative: HTTP(S)-URL zur Quelle statt "
                                "video-Input. Hat Vorrang vor dem video-Input; "
-                               "erspart das Base64-Encoding eines großen Clips."}),
+                               "erspart das Base64-Encoding eines großen Clips. "
+                               "Die Node streamt nur den moov-Atom der URL, um "
+                               "die Source-Dimension zu messen — kein Full-Download."}),
                 "prompt": ("STRING", {
                     "multiline": True, "default": "",
                     "tooltip": "Optional Beschreibung des Clips, lenkt das "
@@ -396,17 +400,41 @@ class Flux3VideoUpscale:
     FUNCTION = "generate"
     CATEGORY = CATEGORY
 
-    async def generate(self, video, upscale_factor, creativity,
+    @staticmethod
+    def _probe_url_dimensions(url: str) -> tuple[int, int]:
+        """Stream-probe a remote clip's (width, height) without downloading it.
+
+        PyAV only pulls the moov atom (kB, not MB) when you open a remote
+        source and read the first video stream's codec context. We don't
+        decode a single frame.
+        """
+        import av
+        with av.open(url, mode="r") as container:
+            for stream in container.streams:
+                if stream.type == "video":
+                    return int(stream.width), int(stream.height)
+        raise ValueError(f"Flux3: kein Video-Stream in {url}")
+
+    async def generate(self, video, target_resolution, creativity,
                        input_video_url="", prompt="",
                        safety_tolerance=SAFETY_TOLERANCE_DEFAULT,
                        timeout_minutes=DEFAULT_TIMEOUT_MINUTES, api_key=""):
-        # input_video: URL takes priority, otherwise base64-encode the VIDEO input.
+        if target_resolution not in UPSCALE_TARGET_SHORT_SIDE:
+            raise ValueError(
+                f"Flux3: target_resolution '{target_resolution}' nicht unterstützt. "
+                f"Erlaubt: {', '.join(UPSCALE_TARGETS)}."
+            )
+        target_short = UPSCALE_TARGET_SHORT_SIDE[target_resolution]
+
+        # --- Source dimensions: URL takes priority; otherwise the VIDEO input.
         url = (input_video_url or "").strip()
         if url:
             if not url.startswith("http"):
                 raise ValueError(
                     "Flux3: input_video_url muss eine HTTP(S)-URL sein."
                 )
+            src_w, src_h = await asyncio.to_thread(
+                self._probe_url_dimensions, url)
             input_video = url
         else:
             if video is None:
@@ -414,13 +442,31 @@ class Flux3VideoUpscale:
                     "Flux3: upscale braucht entweder den video-Input oder "
                     "input_video_url."
                 )
+            src_w, src_h = video.get_dimensions()
             input_video = await asyncio.to_thread(video_to_base64, video)
 
-        if not (UPSCALE_FACTOR_MIN <= upscale_factor <= UPSCALE_FACTOR_MAX):
+        # --- Compute the upscale_factor from the source short side.
+        source_short = min(src_w, src_h)
+        factor = target_short / source_short
+        if factor < UPSCALE_FACTOR_MIN:
             raise ValueError(
-                f"Flux3: upscale_factor muss {UPSCALE_FACTOR_MIN}..{UPSCALE_FACTOR_MAX} "
-                f"sein, bekommen: {upscale_factor}."
+                f"Flux3: Source ist {src_w}x{src_h} (short side {source_short}px) "
+                f"und damit bereits ≥ {target_resolution} (short side "
+                f"{target_short}px). Hochskalieren ergäbe Faktor "
+                f"{factor:.2f} < min {UPSCALE_FACTOR_MIN} — nichts zu upscaling. "
+                f"Wähle ein höheres target_resolution (z.B. 4K) oder eine "
+                f"kleinere Quelle."
             )
+        if factor > UPSCALE_FACTOR_MAX:
+            log.warning(
+                "Flux3: %s aus Source %dx%d (short %d) nicht erreichbar "
+                "(Faktor wäre %.2f, max %.1f). Upcaling mit %.1fx — effektive "
+                "Short Side ~%dpx.",
+                target_resolution, src_w, src_h, source_short,
+                factor, UPSCALE_FACTOR_MAX, UPSCALE_FACTOR_MAX,
+                int(source_short * UPSCALE_FACTOR_MAX),
+            )
+            factor = UPSCALE_FACTOR_MAX
 
         if creativity not in UPSCALE_CREATIVITY_MODES:
             raise ValueError(
@@ -437,7 +483,7 @@ class Flux3VideoUpscale:
 
         payload: dict = {
             "input_video": input_video,
-            "upscale_factor": float(upscale_factor),
+            "upscale_factor": float(factor),
             "creativity": int(creativity_val),
             "safety_tolerance": int(safety_tolerance),
         }
@@ -453,6 +499,11 @@ class Flux3VideoUpscale:
             payload, result, task,
             endpoint_path=UPSCALE_ENDPOINT_PATH,
             header_override="=== FLUX 3 VIDEO UPSCALE ===",
+        )
+        meta += (
+            f"\nsource_resolution : {src_w}x{src_h}\n"
+            f"target_resolution : {target_resolution} (short side {target_short}px)\n"
+            f"computed_factor   : {factor:.2f}"
         )
         return (VideoFromFile(io.BytesIO(data)), meta)
 

@@ -56,6 +56,14 @@ UPSCALE_CREATIVITY_MODES = ["precise", "creative"]  # 0 / 1
 UPSCALE_VIDEO_MAX_SECONDS = 20
 UPSCALE_VIDEO_MAX_MB = 50
 
+# Target resolutions the node offers as a friendlier alternative to a raw
+# upscale_factor. We compute the factor from the source short side so the
+# output lands at ~target_short pixels on the short edge, preserving the
+# source aspect ratio. Matches the short-side convention BFL uses in their
+# pricing table (1080p = 1920x1080, 2K = 2560x1440, 4K = 3840x2160).
+UPSCALE_TARGETS = ["1080p", "2K", "4K"]
+UPSCALE_TARGET_SHORT_SIDE = {"1080p": 1080, "2K": 1440, "4K": 2160}
+
 # Queues on the BFL side can run well past 15 minutes; ComfyUI itself never times out.
 DEFAULT_TIMEOUT_MINUTES = 45
 DEFAULT_TIMEOUT = DEFAULT_TIMEOUT_MINUTES * 60

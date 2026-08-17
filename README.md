@@ -130,13 +130,34 @@ Outputs: `video` (mp4, source audio preserved) and `metadata`. Feed straight int
 | Field | Required | Values |
 |---|---|---|
 | `video` | yes (or `input_video_url`) | ComfyUI VIDEO input (mp4) |
-| `input_video_url` | – | HTTP(S) URL to the source; takes priority over `video`, saves base64-encoding a large clip |
-| `upscale_factor` | – | `1.5`–`3.0`, default `2.0`. Preserves the source aspect ratio |
+| `target_resolution` | yes | `1080p` · `2K` · `4K` (default `4K`). Target on the **short side**; the node computes the upscale_factor from the source dimensions |
+| `input_video_url` | – | HTTP(S) URL to the source; takes priority over `video`, saves base64-encoding a large clip. The node only streams the moov atom to measure source dimensions — no full download |
 | `creativity` | – | `precise` (0) or `creative` (1, default) — see modes below |
 | `prompt` | – | Optional description steering the enhanced detail (mostly in creative mode) |
 | `safety_tolerance` | – | 0 (strictest) to 4, default 2. Moderates the prompt and delivered frames |
 | `timeout_minutes` | – | default 45, up to 240 |
 | `api_key` | – | empty = from `.env` |
+
+### `target_resolution` and factor computation
+
+The node measures the source dimensions and computes `upscale_factor`:
+
+```
+factor = target_short / min(source_w, source_h)
+```
+
+| `target_resolution` | Short-side target | ~16:9 output |
+|---|---|---|
+| `1080p` | 1080 px | 1920×1080 |
+| `2K` | 1440 px | 2560×1440 |
+| `4K` (default) | 2160 px | 3840×2160 |
+
+- **Source ≥ target** (factor < 1.5): the node errors — there's nothing to
+  upscale. Pick a higher `target_resolution` or a smaller source.
+- **Factor > 3.0** (e.g. a 360p source targeting 4K): the node clamps to 3.0× and
+  warns that the target isn't fully reachable. Effective short side ~`source_short × 3`.
+- BFL additionally caps output at ~14.4 MP per frame — very large sources end up
+  below the target even at `4K`.
 
 ### Modes (`creativity`)
 
