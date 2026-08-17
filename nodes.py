@@ -4,6 +4,11 @@ Flux3Video — documented endpoint POST /v1/flux-3-video, four modes
 (t2v / i2v / v2v / draft_enhance).
 Spec: https://docs.bfl.ai/api-reference/utility/generate-a-video-with-flux-3
 
+Flux3VideoUpscale — documented endpoint POST /v1/flux-tools/video-upscale-v1,
+super-resolution for short clips (≤20s, ≤50MB) with a precise and a creative
+mode. Output capped at ~14.4 MP per frame; source audio preserved.
+Spec: https://docs.bfl.ai/api-reference/utility/video-upscale-v1
+
 Flux3Prompter — LLM-powered prompt generator (OpenRouter) that turns a vague
 idea into a structured FLUX 3 prompt, guided by a prompting skill.
 """
@@ -28,6 +33,13 @@ from .flux3_client import (
     SAFETY_TOLERANCE_DEFAULT,
     SAFETY_TOLERANCE_MAX,
     SAFETY_TOLERANCE_MIN,
+    UPSCALE_CREATIVITY_MODES,
+    UPSCALE_ENDPOINT_PATH,
+    UPSCALE_FACTOR_DEFAULT,
+    UPSCALE_FACTOR_MAX,
+    UPSCALE_FACTOR_MIN,
+    UPSCALE_VIDEO_MAX_MB,
+    UPSCALE_VIDEO_MAX_SECONDS,
     VIDEO_MODES,
     Flux3Client,
     batch_to_base64,
@@ -313,6 +325,138 @@ class Flux3Video:
                 format_metadata(payload, result, task))
 
 
+class Flux3VideoUpscale:
+    """FLUX Video Upscale — super-resolution for short clips.
+
+    POST /v1/flux-tools/video-upscale-v1. Source clip max 20 s / 50 MB; output
+    capped at ~14.4 MP per frame (very large sources get upscaled by less than
+    the requested factor). The source audio track is preserved.
+
+    Two modes via `creativity`:
+      - precise (0): preserves the source exactly and sharpens it. Use when
+        identity matters (faces, products, brand assets, real people).
+      - creative (1, default): restores/invents fine detail more aggressively.
+        Good for generated footage, textures, crowds, scenery. Does not strictly
+        preserve identity — faces/products can drift.
+
+    Spec: https://docs.bfl.ai/api-reference/utility/video-upscale-v1
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video": ("VIDEO", {
+                    "tooltip": "Der Clip, der upgescalet wird (mp4). Max "
+                               f"{UPSCALE_VIDEO_MAX_SECONDS} s und "
+                               f"{UPSCALE_VIDEO_MAX_MB} MB. Alternativ "
+                               "input_video_url verwenden."}),
+                "upscale_factor": ("FLOAT", {
+                    "default": UPSCALE_FACTOR_DEFAULT,
+                    "min": UPSCALE_FACTOR_MIN, "max": UPSCALE_FACTOR_MAX, "step": 0.1,
+                    "tooltip": "Skalierung relativ zur Source-Auflösung, "
+                               f"{UPSCALE_FACTOR_MIN}–{UPSCALE_FACTOR_MAX}. Default 2. "
+                               "Sehr hohe Source-Auflösungen werden unterhalb des "
+                               "Werts skaliert (Output max ~14.4 MP pro Frame)."}),
+                "creativity": (UPSCALE_CREATIVITY_MODES, {
+                    "default": "creative",
+                    "tooltip": "precise (0) = identitätserhaltend, scharf — für "
+                               "Gesichter/Produkte/echte Menschen. "
+                               "creative (1, default) = erfindet Detail, gut für "
+                               "generierte Footage/Landschaften/Texturen; "
+                               "Gesichter/Produkte können driften."}),
+            },
+            "optional": {
+                "input_video_url": ("STRING", {
+                    "default": "",
+                    "tooltip": "Alternative: HTTP(S)-URL zur Quelle statt "
+                               "video-Input. Hat Vorrang vor dem video-Input; "
+                               "erspart das Base64-Encoding eines großen Clips."}),
+                "prompt": ("STRING", {
+                    "multiline": True, "default": "",
+                    "tooltip": "Optional Beschreibung des Clips, lenkt das "
+                               "enhanced Detail (vor allem im creative-Modus). "
+                               "Leer = neutraler Upscale."}),
+                "safety_tolerance": ("INT", {
+                    "default": SAFETY_TOLERANCE_DEFAULT,
+                    "min": SAFETY_TOLERANCE_MIN, "max": SAFETY_TOLERANCE_MAX,
+                    "tooltip": "0 (strengste) bis 4, Default 2. Moderation für "
+                               "Prompt und ausgelieferte Frames."}),
+                "timeout_minutes": ("INT", {
+                    "default": DEFAULT_TIMEOUT_MINUTES, "min": 1, "max": 240,
+                    "tooltip": "Wie lange die Node auf das Ergebnis wartet. "
+                               "Upscale kann ähnlich lange wie eine Video-"
+                               "Generierung brauchen."}),
+                "api_key": ("STRING", {"default": "", "tooltip": "Leer = aus .env"}),
+            },
+        }
+
+    RETURN_TYPES = ("VIDEO", "STRING")
+    RETURN_NAMES = ("video", "metadata")
+    FUNCTION = "generate"
+    CATEGORY = CATEGORY
+
+    async def generate(self, video, upscale_factor, creativity,
+                       input_video_url="", prompt="",
+                       safety_tolerance=SAFETY_TOLERANCE_DEFAULT,
+                       timeout_minutes=DEFAULT_TIMEOUT_MINUTES, api_key=""):
+        # input_video: URL takes priority, otherwise base64-encode the VIDEO input.
+        url = (input_video_url or "").strip()
+        if url:
+            if not url.startswith("http"):
+                raise ValueError(
+                    "Flux3: input_video_url muss eine HTTP(S)-URL sein."
+                )
+            input_video = url
+        else:
+            if video is None:
+                raise ValueError(
+                    "Flux3: upscale braucht entweder den video-Input oder "
+                    "input_video_url."
+                )
+            input_video = await asyncio.to_thread(video_to_base64, video)
+
+        if not (UPSCALE_FACTOR_MIN <= upscale_factor <= UPSCALE_FACTOR_MAX):
+            raise ValueError(
+                f"Flux3: upscale_factor muss {UPSCALE_FACTOR_MIN}..{UPSCALE_FACTOR_MAX} "
+                f"sein, bekommen: {upscale_factor}."
+            )
+
+        if creativity not in UPSCALE_CREATIVITY_MODES:
+            raise ValueError(
+                f"Flux3: creativity '{creativity}' nicht unterstützt. "
+                f"Erlaubt: {', '.join(UPSCALE_CREATIVITY_MODES)}."
+            )
+        creativity_val = 1 if creativity == "creative" else 0
+
+        if not (SAFETY_TOLERANCE_MIN <= safety_tolerance <= SAFETY_TOLERANCE_MAX):
+            raise ValueError(
+                f"Flux3: safety_tolerance muss {SAFETY_TOLERANCE_MIN}..{SAFETY_TOLERANCE_MAX} "
+                f"sein, bekommen: {safety_tolerance}."
+            )
+
+        payload: dict = {
+            "input_video": input_video,
+            "upscale_factor": float(upscale_factor),
+            "creativity": int(creativity_val),
+            "safety_tolerance": int(safety_tolerance),
+        }
+        if prompt.strip():
+            payload["prompt"] = prompt.strip()
+
+        client = Flux3Client(api_key)
+        task = await asyncio.to_thread(client.submit_upscale, payload)
+        result = await client.poll_async(task, timeout=timeout_minutes * 60)
+        data = await asyncio.to_thread(client.download, extract_url(result))
+
+        meta = format_metadata(
+            payload, result, task,
+            endpoint_path=UPSCALE_ENDPOINT_PATH,
+            header_override="=== FLUX 3 VIDEO UPSCALE ===",
+        )
+        return (VideoFromFile(io.BytesIO(data)), meta)
+
+
 # ===========================================================================
 # Flux3Prompter — LLM-powered prompt generator (OpenRouter)
 # ===========================================================================
@@ -476,10 +620,12 @@ class Flux3Prompter:
 
 NODE_CLASS_MAPPINGS = {
     "Flux3Video": Flux3Video,
+    "Flux3VideoUpscale": Flux3VideoUpscale,
     "Flux3Prompter": Flux3Prompter,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "Flux3Video": "Flux 3 Video (API)",
+    "Flux3VideoUpscale": "Flux 3 Video Upscale (API)",
     "Flux3Prompter": "Flux 3 Openrouter Prompt",
 }

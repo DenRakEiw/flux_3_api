@@ -42,6 +42,20 @@ SAFETY_TOLERANCE_MIN = 0
 SAFETY_TOLERANCE_MAX = 4
 MAX_KEYFRAMES = 10
 
+# --- Video Upscale endpoint (released) --------------------------------------
+# POST https://api.bfl.ai/v1/flux-tools/video-upscale-v1
+# Super-resolution for short clips (max 20 s, 50 MB). Two modes: precise
+# (creativity: 0) preserves identity, creative (creativity: 1, default) enhances
+# detail more aggressively. Output capped at ~14.4 MP per frame. Source audio is
+# preserved. Spec: https://docs.bfl.ai/api-reference/utility/video-upscale-v1
+UPSCALE_ENDPOINT_PATH = "v1/flux-tools/video-upscale-v1"
+UPSCALE_FACTOR_MIN = 1.5
+UPSCALE_FACTOR_MAX = 3.0
+UPSCALE_FACTOR_DEFAULT = 2.0
+UPSCALE_CREATIVITY_MODES = ["precise", "creative"]  # 0 / 1
+UPSCALE_VIDEO_MAX_SECONDS = 20
+UPSCALE_VIDEO_MAX_MB = 50
+
 # Queues on the BFL side can run well past 15 minutes; ComfyUI itself never times out.
 DEFAULT_TIMEOUT_MINUTES = 45
 DEFAULT_TIMEOUT = DEFAULT_TIMEOUT_MINUTES * 60
@@ -174,6 +188,39 @@ class Flux3Client:
         log.info("Flux3: task %s submitted (cost: %s credits)", data.get("id"), cost)
         return data
 
+    def submit_upscale(self, payload: dict) -> dict:
+        """Submit a video-upscale task to POST /v1/flux-tools/video-upscale-v1.
+
+        Same task/polling_url shape as submit(), so poll_async() and download()
+        work unchanged. The BFL upscale endpoint does not return a `cost` field
+        on submit; pricing is per megapixel-second of delivered output.
+        """
+        url = f"{self.base_url}/{UPSCALE_ENDPOINT_PATH}"
+        size_mb = len(json.dumps(payload).encode()) / (1024 * 1024)
+        if size_mb > 1:
+            log.info("Flux3: sende %.1f MB an %s", size_mb, UPSCALE_ENDPOINT_PATH)
+
+        resp = self.session.post(url, json=payload, timeout=300)
+
+        if resp.status_code in (401, 403):
+            raise RuntimeError(f"Flux3: API-Key ungültig oder fehlt (HTTP {resp.status_code}).")
+        if not resp.ok:
+            # The body says WHY (bad base64, clip >20s, payload >50MB, moderation, ...).
+            detail = resp.text[:1000] if resp.text else "(kein Fehlertext)"
+            hint = ""
+            if resp.status_code in (400, 413) and size_mb > 5:
+                hint = (f" Der Request war {size_mb:.1f} MB groß — vermutlich ist "
+                        f"input_video zu groß (max {UPSCALE_VIDEO_MAX_MB} MB, "
+                        f"{UPSCALE_VIDEO_MAX_SECONDS} s).")
+            raise RuntimeError(
+                f"Flux3: API lehnt den Upscale-Request ab (HTTP {resp.status_code}): "
+                f"{detail}{hint}"
+            )
+
+        data = resp.json()
+        log.info("Flux3: upscale task %s submitted", data.get("id"))
+        return data
+
     def poll(self, task: dict, timeout: float = 900.0, interval: float = 2.0) -> Any:
         polling_url = task["polling_url"]
         task_id = task["id"]
@@ -301,7 +348,7 @@ class Flux3Client:
 
 
 # Payload keys whose values are base64 blobs - never dump those into the debug output.
-BLOB_KEYS = ("keyframes", "start_video", "draft_cache")
+BLOB_KEYS = ("keyframes", "start_video", "draft_cache", "input_video")
 
 
 def _describe_blob(value: Any) -> str:
@@ -323,12 +370,25 @@ def _describe_blob(value: Any) -> str:
     return repr(value)
 
 
-def format_metadata(payload: dict, result: Any, task: dict) -> str:
-    """Full, untruncated dump of everything about a run - for a Show Any node."""
+def format_metadata(payload: dict, result: Any, task: dict,
+                    endpoint_path: str = "",
+                    header_override: str = "") -> str:
+    """Full, untruncated dump of everything about a run - for a Show Any node.
+
+    endpoint_path / header_override: when set, render the header/endpoint line
+    for a non-default endpoint (e.g. the video-upscale tool). Used by
+    Flux3VideoUpscale so its metadata is labelled correctly.
+    """
     result = result if isinstance(result, dict) else {}
+    if endpoint_path:
+        header = header_override or "=== FLUX 3 ==="
+        path = endpoint_path
+    else:
+        header = "=== FLUX 3 VIDEO ==="
+        path = ENDPOINT_PATH
     lines = [
-        "=== FLUX 3 VIDEO ===",
-        f"endpoint       : POST {get_base_url()}/{ENDPOINT_PATH}",
+        header,
+        f"endpoint       : POST {get_base_url()}/{path}",
         f"task_id        : {task.get('id', '?')}",
         f"polling_url    : {task.get('polling_url', '?')}",
     ]

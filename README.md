@@ -7,6 +7,12 @@ ComfyUI nodes for the BFL Flux 3 video API, plus an LLM-powered prompt generator
 - **Flux 3 Video (API)** — generates video via `POST https://api.bfl.ai/v1/flux-3-video`
   ([Docs](https://docs.bfl.ai/flux_3/flux3_video),
   [API reference](https://docs.bfl.ai/api-reference/utility/generate-a-video-with-flux-3)).
+- **Flux 3 Video Upscale (API)** — super-resolution for short clips (≤20s, ≤50MB)
+  via `POST https://api.bfl.ai/v1/flux-tools/video-upscale-v1`
+  ([Docs](https://docs.bfl.ai/flux_3/video_upscale),
+  [API reference](https://docs.bfl.ai/api-reference/utility/video-upscale-v1)).
+  Precise mode preserves identity; creative mode enhances detail. Output capped
+  at ~14.4 MP per frame; source audio preserved.
 - **Flux 3 Openrouter Prompt** — turns a vague idea into a structured FLUX 3 prompt
   using an OpenRouter LLM, guided by a prompting skill. Output feeds straight into
   the Video node's `prompt` input.
@@ -102,6 +108,65 @@ sample         : https://delivery.bfl.ai/results/…
 ```
 
 Base64 images/videos/bundles are rendered as a size rather than a megabyte-long string.
+
+---
+
+## Flux 3 Video Upscale (API)
+
+Super-resolution for short clips via `POST /v1/flux-tools/video-upscale-v1`.
+Outputs: `video` (mp4, source audio preserved) and `metadata`. Feed straight into
+`Save Video`.
+
+### Limits
+
+- Source max **20 s** and **50 MB**. Longer sources are rejected before
+  processing (not truncated, no charge).
+- Output max **~14.4 MP per frame** (4K and beyond). Very large sources get
+  upscaled by less than the requested `upscale_factor`.
+- The **source audio track** is preserved in the output.
+
+### Parameters
+
+| Field | Required | Values |
+|---|---|---|
+| `video` | yes (or `input_video_url`) | ComfyUI VIDEO input (mp4) |
+| `input_video_url` | – | HTTP(S) URL to the source; takes priority over `video`, saves base64-encoding a large clip |
+| `upscale_factor` | – | `1.5`–`3.0`, default `2.0`. Preserves the source aspect ratio |
+| `creativity` | – | `precise` (0) or `creative` (1, default) — see modes below |
+| `prompt` | – | Optional description steering the enhanced detail (mostly in creative mode) |
+| `safety_tolerance` | – | 0 (strictest) to 4, default 2. Moderates the prompt and delivered frames |
+| `timeout_minutes` | – | default 45, up to 240 |
+| `api_key` | – | empty = from `.env` |
+
+### Modes (`creativity`)
+
+| Mode | Value | Behaviour |
+|---|---|---|
+| `precise` | 0 | preserves the source exactly and sharpens it. For faces, products, brand assets, real people. |
+| `creative` | 1 (default) | restores/invents fine detail more aggressively. For generated footage, textures, crowds, scenery. Identity (faces/products) can drift. |
+
+### Pricing
+
+Per **megapixel-second** of delivered output (megapixels per output frame × output
+duration in seconds). You're charged for delivered output only — rejected clips
+cost nothing.
+
+| Mode | Price |
+|---|---|
+| precise (`creativity: 0`) | $0.075 / MP·s |
+| creative (`creativity: 1`) | $0.105 / MP·s |
+
+Roughly per second of output: 1080p $0.15 (precise) / $0.21 (creative), 2K $0.26 / $0.37, 4K $0.59 / $0.83.
+
+### Tips
+
+- Start from the least compressed source material — compression artifacts limit
+  recoverable detail.
+- `creative` for generated footage/landscapes/textures; `precise` when
+  faces/products/brand assets must stay exact.
+- Run upscaling as your **final step**, after editing/trimming, so you only pay
+  for footage you keep.
+- The signed delivery URL expires ~1 h after Ready — download the video in time.
 
 ## Queue / Timeout
 
