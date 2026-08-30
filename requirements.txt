@@ -1,4 +1,4 @@
-# Die Node braucht nur requests zusaetzlich - und selbst das bringt ComfyUI schon mit.
-# torch, numpy, Pillow und av bewusst NICHT hier auflisten: der ComfyUI-Manager wuerde sie
-# sonst ggf. neu installieren und dabei die CUDA-Version von torch zerschiessen.
+# The node only needs `requests` on top of what ComfyUI already ships.
+# torch, numpy, Pillow and av are deliberately NOT listed here: the ComfyUI Manager
+# might reinstall them and break the CUDA build of torch in the process.
 requests>=2.28
