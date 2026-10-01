@@ -1,9 +1,12 @@
 # Flux 3 API — ComfyUI Nodes
 
-ComfyUI nodes for the BFL Flux 3 video API, plus an LLM-powered prompt generator.
+ComfyUI nodes for the BFL Flux 3 image and video API, plus an LLM-powered prompt generator.
 
 ## Nodes
 
+- **Flux 3 Image (API)** — generates or edits images via `POST https://api.bfl.ai/v1/flux-3-image`
+  ([Docs](https://docs.bfl.ai/flux_3/flux3_image_overview),
+  [API reference](https://docs.bfl.ai/api-reference/utility/generate-an-image-with-flux-3)).
 - **Flux 3 Video (API)** — generates video via `POST https://api.bfl.ai/v1/flux-3-video`
   ([Docs](https://docs.bfl.ai/flux_3/flux3_video),
   [API reference](https://docs.bfl.ai/api-reference/utility/generate-a-video-with-flux-3)).
@@ -33,9 +36,33 @@ Optional in `.env`:
 
 ```
 BFL_BASE_URL=https://api.bfl.ai
+BFL_IMAGE_BASE_URL=https://api.bfl.ai
 ```
 
-(Default is `https://api.bfl.ai`; only change it if BFL announces a different host.)
+(`BFL_BASE_URL` is the host for video and upscale, `BFL_IMAGE_BASE_URL` the host for
+the image node. Both default to `https://api.bfl.ai`; only change them if BFL
+announces a different host.)
+
+---
+
+## Flux 3 Image (API)
+
+Text to image, or edit / restyle / combine 1–10 reference images on the `images`
+input (each 256×256 to 16 MP). There is no `mode`: describe in the prompt how the
+references are used ("Turn Image 1 in the style of Image 2").
+
+| Parameter | Values |
+|---|---|
+| `aspect_ratio` | `auto` (first reference image, else 1:1), `21:9` … `9:21` |
+| `resolution` | `768sq`, `1k` (default), `2k`, `4k` (can take several minutes) |
+| `safety_tolerance` | 0–4 (default 2), 0 = strictest |
+| `grounding` | web and image search before generating (default on) |
+
+The API has no seed; the `seed` widget only makes the node run again. For layouts
+with bounding boxes, name elements as `<id>` in the prompt and end it with a JSON
+list of rows, see [Layout and editing](https://docs.bfl.ai/flux_3/flux3_image_layout).
+
+Outputs: `image` and `metadata` (including `cost` and `output_mp`).
 
 ---
 

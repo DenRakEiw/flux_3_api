@@ -9,6 +9,10 @@ super-resolution for short clips (≤20s, ≤50MB) with a precise and a creative
 mode. Output capped at ~14.4 MP per frame; source audio preserved.
 Spec: https://docs.bfl.ai/api-reference/utility/video-upscale-v1
 
+Flux3Image — documented endpoint POST /v1/flux-3-image: text to image, or
+edit / combine up to ten reference images (no mode field).
+Spec: https://docs.bfl.ai/api-reference/utility/generate-an-image-with-flux-3
+
 Flux3Prompter — LLM-powered prompt generator (OpenRouter) that turns a vague
 idea into a structured FLUX 3 prompt, guided by a prompting skill.
 """
@@ -28,7 +32,11 @@ from .flux3_client import (
     DURATION_MAX,
     DURATION_MIN,
     DURATIONS,
+    IMAGE_ASPECT_RATIOS,
+    IMAGE_ENDPOINT_PATH,
+    IMAGE_RESOLUTIONS,
     MAX_KEYFRAMES,
+    MAX_REFERENCE_IMAGES,
     RESOLUTIONS,
     SAFETY_TOLERANCE_DEFAULT,
     SAFETY_TOLERANCE_MAX,
@@ -44,8 +52,10 @@ from .flux3_client import (
     VIDEO_MODES,
     Flux3Client,
     batch_to_base64,
+    bytes_to_image_tensor,
     extract_url,
     format_metadata,
+    get_image_base_url,
     tensor_to_base64,
     video_to_base64,
 )
@@ -503,6 +513,89 @@ class Flux3VideoUpscale:
         return (VideoFromFile(io.BytesIO(data)), meta)
 
 
+class Flux3Image:
+    """FLUX 3 Image: text to image without `images`, edit / restyle / combine
+    with 1-10 reference images. How the references are used goes in the prompt
+    (e.g. "Turn Image 1 in the style of Image 2", or <ref_image_0> layout rows)."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "prompt": ("STRING", {
+                    "multiline": True, "default": "",
+                    "tooltip": "Describe the image or the edit. Layout: name elements as "
+                               "<id> and end the prompt with a JSON list, "
+                               "bbox = [top, left, bottom, right] on 0-1000."}),
+                "aspect_ratio": (IMAGE_ASPECT_RATIOS, {
+                    "default": "auto",
+                    "tooltip": "auto = aspect ratio of the first reference image, "
+                               "1:1 without one."}),
+                "resolution": (IMAGE_RESOLUTIONS, {
+                    "default": "1k",
+                    "tooltip": "Output size. 4k can take several minutes; the exact "
+                               "size is output_mp in metadata."}),
+                "safety_tolerance": ("INT", {
+                    "default": SAFETY_TOLERANCE_DEFAULT,
+                    "min": SAFETY_TOLERANCE_MIN, "max": SAFETY_TOLERANCE_MAX,
+                    "tooltip": "Input and output moderation, 0 = strictest."}),
+                "grounding": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Let the model research the prompt with web and image "
+                               "search before it generates."}),
+                "seed": ("INT", {
+                    "default": 0, "min": 0, "max": 0xffffffffffffffff,
+                    "control_after_generate": True,
+                    "tooltip": "Not sent (the API has no seed); only makes the node "
+                               "run again."}),
+            },
+            "optional": {
+                "images": ("IMAGE", {
+                    "tooltip": "1-10 reference images (batch), each 256x256 to 16 MP. "
+                               "Refer to them in the prompt as Image 1, 2, ... or "
+                               "<ref_image_0>, ..."}),
+                "timeout_minutes": ("INT", {
+                    "default": DEFAULT_TIMEOUT_MINUTES, "min": 1, "max": 240,
+                    "tooltip": "How long the node waits for the result."}),
+                "api_key": ("STRING", {"default": "", "tooltip": "Empty = from .env"}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "STRING")
+    RETURN_NAMES = ("image", "metadata")
+    FUNCTION = "generate"
+    CATEGORY = CATEGORY
+
+    async def generate(self, prompt, aspect_ratio, resolution, safety_tolerance, grounding,
+                       seed, images=None, timeout_minutes=DEFAULT_TIMEOUT_MINUTES, api_key=""):
+        if not prompt.strip():
+            raise ValueError("Flux3: prompt must not be empty.")
+
+        payload: dict = {
+            "prompt": prompt.strip(),
+            "aspect_ratio": aspect_ratio,
+            "resolution": resolution,
+            "safety_tolerance": int(safety_tolerance),
+            "grounding": bool(grounding),
+        }
+        if images is not None:
+            if len(images) > MAX_REFERENCE_IMAGES:
+                log.warning("Flux3Image: %d reference images, the API only takes the first %d.",
+                            len(images), MAX_REFERENCE_IMAGES)
+            payload["images"] = await asyncio.to_thread(
+                batch_to_base64, images, MAX_REFERENCE_IMAGES)
+
+        client = Flux3Client(api_key)
+        task = await asyncio.to_thread(client.submit_image, payload)
+        result = await client.poll_async(task, timeout=timeout_minutes * 60)
+        data = await asyncio.to_thread(client.download, extract_url(result))
+        return (bytes_to_image_tensor(data),
+                format_metadata(payload, result, task,
+                                endpoint_path=IMAGE_ENDPOINT_PATH,
+                                header_override="=== FLUX 3 IMAGE ===",
+                                base_url=get_image_base_url()))
+
+
 # ===========================================================================
 # Flux3Prompter — LLM-powered prompt generator (OpenRouter)
 # ===========================================================================
@@ -666,12 +759,14 @@ class Flux3Prompter:
 
 
 NODE_CLASS_MAPPINGS = {
+    "Flux3Image": Flux3Image,
     "Flux3Video": Flux3Video,
     "Flux3VideoUpscale": Flux3VideoUpscale,
     "Flux3Prompter": Flux3Prompter,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "Flux3Image": "Flux 3 Image (API)",
     "Flux3Video": "Flux 3 Video (API)",
     "Flux3VideoUpscale": "Flux 3 Video Upscale (API)",
     "Flux3Prompter": "Flux 3 Openrouter Prompt",

@@ -1,6 +1,6 @@
-"""HTTP client + media helpers for the BFL Flux 3 Video API.
+"""HTTP client + media helpers for the BFL Flux 3 API.
 
-Single documented endpoint: POST https://api.bfl.ai/v1/flux-3-video
+Video endpoint: POST https://api.bfl.ai/v1/flux-3-video
 Schema: discriminated union on the `mode` field (t2v / i2v / v2v / draft_enhance),
 each branch strict (additionalProperties: false). Spec:
 https://docs.bfl.ai/api-reference/utility/generate-a-video-with-flux-3
@@ -8,6 +8,7 @@ https://docs.bfl.ai/api-reference/utility/generate-a-video-with-flux-3
 
 import asyncio
 import base64
+import hashlib
 import io
 import json
 import logging
@@ -41,6 +42,22 @@ SAFETY_TOLERANCE_DEFAULT = 2
 SAFETY_TOLERANCE_MIN = 0
 SAFETY_TOLERANCE_MAX = 4
 MAX_KEYFRAMES = 10
+
+# --- Image endpoint (released) ----------------------------------------------
+# POST https://api.bfl.ai/v1/flux-3-image
+# No mode field: t2i without `images`, edit / multi-reference with 1-10 `images`
+# (URL or base64, each 256x256 .. 16 MP). Unknown fields return 422, so no
+# seed/width/height. Spec: https://docs.bfl.ai/api-reference/utility/generate-an-image-with-flux-3
+IMAGE_ENDPOINT_PATH = "v1/flux-3-image"
+IMAGE_DEFAULT_BASE_URL = "https://api.bfl.ai"
+IMAGE_ASPECT_RATIOS = [
+    "auto",
+    "21:9", "2:1", "16:9", "3:2", "7:5", "4:3", "5:4",
+    "1:1",
+    "4:5", "3:4", "5:7", "2:3", "9:16", "1:2", "9:21",
+]
+IMAGE_RESOLUTIONS = ["768sq", "1k", "2k", "4k"]
+MAX_REFERENCE_IMAGES = 10
 
 # --- Video Upscale endpoint (released) --------------------------------------
 # POST https://api.bfl.ai/v1/flux-tools/video-upscale-v1
@@ -107,9 +124,27 @@ def get_api_key(override: str = "") -> str:
     return key
 
 
+def _key_fingerprint(key: str) -> str:
+    """Identify a key in a log line without revealing it: length, prefix and a
+    short hash. Enough to tell two keys apart, useless to anyone who reads it."""
+    if not key:
+        return "(none)"
+    return (f"len={len(key)} prefix={key[:4]}... "
+            f"fp={hashlib.sha256(key.encode()).hexdigest()[:8]}")
+
+
 def get_base_url() -> str:
     env = _load_dotenv()
     url = env.get("BFL_BASE_URL") or os.environ.get("BFL_BASE_URL") or DEFAULT_BASE_URL
+    return url.rstrip("/")
+
+
+def get_image_base_url() -> str:
+    """Host for the image endpoint. Separate from BFL_BASE_URL so a regional
+    video host does not have to serve the image route too."""
+    env = _load_dotenv()
+    url = (env.get("BFL_IMAGE_BASE_URL") or os.environ.get("BFL_IMAGE_BASE_URL")
+           or IMAGE_DEFAULT_BASE_URL)
     return url.rstrip("/")
 
 
@@ -129,8 +164,14 @@ def tensor_to_base64(image: torch.Tensor, fmt: str = "PNG") -> str:
 
 
 def batch_to_base64(images: torch.Tensor, limit: int | None = None) -> list[str]:
-    out = [tensor_to_base64(img) for img in images]
-    return out[:limit] if limit else out
+    return [tensor_to_base64(img) for img in images[:limit]]
+
+
+def bytes_to_image_tensor(data: bytes) -> torch.Tensor:
+    """Raw image bytes (PNG/JPEG/...) -> ComfyUI IMAGE tensor [1,H,W,3] in 0..1."""
+    pil = Image.open(io.BytesIO(data)).convert("RGB")
+    arr = np.array(pil).astype(np.float32) / 255.0
+    return torch.from_numpy(arr).unsqueeze(0)
 
 
 def video_to_base64(video) -> str:
@@ -224,6 +265,33 @@ class Flux3Client:
         data = resp.json()
         cost = data.get("cost")
         log.info("Flux3: task %s submitted (cost: %s credits)", data.get("id"), cost)
+        return data
+
+    def submit_image(self, payload: dict) -> dict:
+        """Submit a FLUX 3 image task to POST /v1/flux-3-image."""
+        url = f"{get_image_base_url()}/{IMAGE_ENDPOINT_PATH}"
+        size_mb = len(json.dumps(payload).encode()) / (1024 * 1024)
+        if size_mb > 1:
+            log.info("Flux3: sending %.1f MB to %s", size_mb, IMAGE_ENDPOINT_PATH)
+
+        resp = self.session.post(url, json=payload, timeout=300)
+
+        if resp.status_code in (401, 403):
+            detail = resp.text[:500] if resp.text else "(no error text)"
+            raise RuntimeError(
+                f"Flux3: the image endpoint refused the key (HTTP {resp.status_code}) at "
+                f"{url}. Key: {_key_fingerprint(self.api_key)}. Server said: {detail}"
+            )
+        if not resp.ok:
+            # The body says WHY (image below 256x256 / above 16 MP, unknown field, moderation, ...).
+            detail = resp.text[:1000] if resp.text else "(no error text)"
+            raise RuntimeError(
+                f"Flux3: the image API rejected the request (HTTP {resp.status_code}): {detail}"
+            )
+
+        data = resp.json()
+        log.info("Flux3: image task %s submitted (cost: %s credits, %s MP)",
+                 data.get("id"), data.get("cost"), data.get("output_mp"))
         return data
 
     def submit_upscale(self, payload: dict) -> dict:
@@ -385,7 +453,7 @@ class Flux3Client:
 
 
 # Payload keys whose values are base64 blobs - never dump those into the debug output.
-BLOB_KEYS = ("keyframes", "start_video", "draft_cache", "input_video")
+BLOB_KEYS = ("keyframes", "start_video", "draft_cache", "input_video", "images")
 
 
 def _describe_blob(value: Any) -> str:
@@ -409,12 +477,12 @@ def _describe_blob(value: Any) -> str:
 
 def format_metadata(payload: dict, result: Any, task: dict,
                     endpoint_path: str = "",
-                    header_override: str = "") -> str:
+                    header_override: str = "",
+                    base_url: str = "") -> str:
     """Full, untruncated dump of everything about a run - for a Show Any node.
 
-    endpoint_path / header_override: when set, render the header/endpoint line
-    for a non-default endpoint (e.g. the video-upscale tool). Used by
-    Flux3VideoUpscale so its metadata is labelled correctly.
+    endpoint_path / header_override / base_url: when set, render the
+    header/endpoint line for a non-default endpoint (video-upscale, image).
     """
     result = result if isinstance(result, dict) else {}
     if endpoint_path:
@@ -425,7 +493,7 @@ def format_metadata(payload: dict, result: Any, task: dict,
         path = ENDPOINT_PATH
     lines = [
         header,
-        f"endpoint       : POST {get_base_url()}/{path}",
+        f"endpoint       : POST {base_url or get_base_url()}/{path}",
         f"task_id        : {task.get('id', '?')}",
         f"polling_url    : {task.get('polling_url', '?')}",
     ]
